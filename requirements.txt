@@ -7,4 +7,5 @@ opencv-python
 decord
 tqdm
 mediapipe
+onnxruntime
 

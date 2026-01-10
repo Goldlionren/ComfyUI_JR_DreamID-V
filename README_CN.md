@@ -25,7 +25,9 @@
 * ✅ 支持 **CPU / GPU 混合 Offload**
 * ✅ 修复多个在中低显存环境下常见的 OOM / 兼容性问题
 * ✅ 在保持兼容原有 workflow 的前提下，提供更灵活的设备配置
-
+* 🕺 **DWPose（ONNX + GPU 加速，JR 增强）**  
+  使用 DWPose（ONNXRuntime）替代原有 MediaPipe 姿态提取流程，  
+  在复杂动作视频中稳定性与成功率显著提升，支持 CUDA / TensorRT 加速。
 ---
 
 ## ✨ 功能特点
@@ -35,7 +37,9 @@
 * 🖼️ **参考图像**：使用单张人脸图像作为身份参考
 * 🔧 **ComfyUI 集成**：无缝集成至 ComfyUI 工作流
 * 🧠 **低显存友好（JR Fork）**：T5 / 主模型 / VAE 可分设备加载
-
+* 🕺 **DWPose（ONNX + GPU 加速，JR 增强）**  
+  使用 DWPose（ONNXRuntime）替代原有 MediaPipe 姿态提取流程，  
+  在复杂动作视频中稳定性与成功率显著提升，支持 CUDA / TensorRT 加速。
 ---
 
 ## 📋 节点说明
@@ -57,6 +61,122 @@
 | `RunningHub_DreamID-V_Sampler` | 原始 Sampler（Legacy） |
 
 > 💡 **建议新建工作流时使用 JR 节点，旧 workflow 无需修改即可继续使用。**
+
+---
+
+## 🕺 DWPose 姿态后端（JR 增强功能）
+
+JR Fork 已将姿态提取后端升级为 **DWPose（基于 ONNXRuntime）**，
+用于替代原有的 MediaPipe FaceMesh 流程。
+
+### 为什么使用 DWPose？
+
+* ✅ 对快速 / 复杂动作更稳定
+* ✅ 显著减少 “no pose detected” 错误
+* ✅ 支持 **ONNX Runtime GPU 加速（CUDA / TensorRT）**
+* ✅ 与 PyTorch 设备配置完全解耦
+
+---
+
+### 后端行为说明
+
+* **默认姿态后端**：`dwpose`
+* **自动回退机制**：ONNXRuntime / GPU 不可用时回退至 MediaPipe
+* **设备完全独立**：
+  * T5 可运行在 **CPU**
+  * DWPose 仍可运行在 **GPU**
+  * 两者互不影响
+
+---
+
+### DWPose 所需模型（ONNX）
+
+请将以下模型放置于：
+
+```
+ComfyUI/models/DreamID-V/pose/models/
+├── dw-ll_ucoco_384.onnx
+└── yolox_l.onnx
+```
+
+⚠️ 模型文件 **不包含在仓库中**。
+
+---
+
+### 自动下载（可选）
+
+JR Fork 支持 **自动下载 DWPose ONNX 模型**。
+
+可通过环境变量启用：
+
+```bash
+DREAMIDV_AUTO_DOWNLOAD_DWPOSE=1
+```
+
+若未启用，将给出清晰提示，指明缺失文件与放置路径。
+
+---
+
+### ONNXRuntime 加速说明
+
+* 支持的执行后端：
+  * `CUDAExecutionProvider`
+  * `TensorrtExecutionProvider`（如环境支持）
+  * `CPUExecutionProvider`（回退）
+
+运行时日志示例：
+
+```
+[DWPose] det providers : ['CUDAExecutionProvider', 'CPUExecutionProvider']
+[DWPose] pose providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+---
+
+## 🚀 使用方法
+
+1. 安装 ComfyUI（建议 Python ≥ 3.10）
+2. 将本仓库克隆至：
+
+```
+ComfyUI/custom_nodes/ComfyUI_JR_DreamID-V
+```
+
+3. 安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+4. 下载 DreamID-V 与 DWPose 所需模型
+5. 启动 ComfyUI
+
+> 💡 **说明**：  
+> 即使在 Loader 中将 **T5 设置为 `cpu`**，  
+> DWPose 姿态提取仍可通过 ONNXRuntime 使用 GPU，两者互不影响。
+
+---
+
+## 🖥️ 系统要求
+
+* 操作系统：Windows / Linux
+* GPU：NVIDIA（推荐 ≥16GB 显存）
+* Python：3.10+
+* PyTorch：CUDA 版本
+* **ONNX Runtime**：
+  * `onnxruntime`（CPU）
+  * `onnxruntime-gpu`（推荐，支持 GPU 加速）
+
+---
+
+## 🔀 JR Fork 核心改进点
+
+相较于原版 DreamID-V：
+
+* ✅ 使用 DWPose（ONNX）替代 MediaPipe 姿态提取
+* ✅ 支持 GPU 加速姿态识别（CUDA / TensorRT）
+* ✅ 明确区分 T5 / Pose / UNet 的运行设备
+* ✅ 在真实视频场景下稳定性显著提升
 
 ---
 

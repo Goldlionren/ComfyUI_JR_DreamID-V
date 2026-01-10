@@ -9,6 +9,9 @@ import warnings
 import uuid
 import subprocess
 
+import urllib.request
+import shutil
+
 warnings.filterwarnings('ignore')
 
 import torch, random
@@ -23,10 +26,143 @@ from .dreamidv_wan.utils.utils import cache_video, cache_image, str2bool
 import cv2
 import numpy as np
 from .express_adaption.media_pipe import FaceMeshDetector, FaceMeshAlign_dreamidv
+from .pose.extract import process_dwpose
+
 from .express_adaption.get_video_npy import get_video_npy
 import folder_paths
 
 import types
+
+
+# ---------------- DWPose ONNX models (ComfyUI/models convention) ----------------
+DWPOSE_FILES = {
+    "dw-ll_ucoco_384.onnx": "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx",
+    "yolox_l.onnx": "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx",
+}
+
+def _dwpose_models_dir():
+    # ComfyUI/models/DreamID-V/pose/models
+    return os.path.join(folder_paths.models_dir, "DreamID-V", "pose", "models")
+
+def ensure_dwpose_models(auto_download: bool = False, timeout: int = 30) -> str:
+    """Ensure DWPose ONNX models exist. Returns the models directory path."""
+    models_dir = _dwpose_models_dir()
+    os.makedirs(models_dir, exist_ok=True)
+
+    missing = [fn for fn in DWPOSE_FILES.keys() if not os.path.exists(os.path.join(models_dir, fn))]
+    if not missing:
+        return models_dir
+
+    if not auto_download:
+        raise FileNotFoundError(
+            "Missing DWPose model files:\n"
+            + "\n".join([f"  - {fn}" for fn in missing])
+            + "\nPlease place them under:\n"
+            + f"  {models_dir}\n"
+            + "Or enable auto-download (auto_download_dwpose=True)."
+        )
+
+    for fn in missing:
+        url = DWPOSE_FILES[fn]
+        dst = os.path.join(models_dir, fn)
+        tmp = dst + ".download"
+        try:
+            print(f"[DreamID-V] DWPose model missing: {dst}")
+            print(f"[DreamID-V] Downloading: {url}")
+            with urllib.request.urlopen(url, timeout=timeout) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+
+            # basic sanity check (avoid HTML error page etc.)
+            if os.path.getsize(tmp) < 1024 * 1024:
+                raise RuntimeError("Downloaded file too small; likely invalid content.")
+
+            os.replace(tmp, dst)
+            print(f"[DreamID-V] Downloaded: {dst}")
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Failed to auto-download DWPose model:\n"
+                f"  - file : {fn}\n"
+                f"  - url  : {url}\n"
+                f"  - error: {repr(e)}\n"
+                "You can download manually and place it under:\n"
+                f"  {models_dir}"
+            )
+
+    return models_dir
+
+
+
+DWPOSE_FILES = {
+    "dw-ll_ucoco_384.onnx": "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx",
+    "yolox_l.onnx": "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx",
+}
+
+def _dwpose_models_dir():
+    # ComfyUI/models/DreamID-V/pose/models
+    return os.path.join(folder_paths.models_dir, "DreamID-V", "pose", "models")
+
+def ensure_dwpose_models(auto_download: bool = True) -> str:
+    """
+    Ensure DWPose ONNX models exist in ComfyUI models directory.
+    Returns the models directory path.
+    """
+    models_dir = _dwpose_models_dir()
+    os.makedirs(models_dir, exist_ok=True)
+
+    missing = []
+    for fn in DWPOSE_FILES.keys():
+        if not os.path.exists(os.path.join(models_dir, fn)):
+            missing.append(fn)
+
+    if not missing:
+        return models_dir
+
+    if not auto_download:
+        raise FileNotFoundError(
+            "Missing DWPose model files:\n"
+            f"  - {', '.join(missing)}\n"
+            "Please place them under:\n"
+            f"  {models_dir}\n"
+            "Or enable auto-download in node settings."
+        )
+
+    # Auto-download missing files (atomic write via temp file + move)
+    for fn in missing:
+        url = DWPOSE_FILES[fn]
+        dst = os.path.join(models_dir, fn)
+        tmp = dst + ".download"
+        try:
+            print(f"[DreamID-V] DWPose model missing: {dst}")
+            print(f"[DreamID-V] Downloading from: {url}")
+            with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            os.replace(tmp, dst)
+            print(f"[DreamID-V] Downloaded: {dst}")
+        except Exception as e:
+            # cleanup temp
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Failed to auto-download DWPose model:\n"
+                f"  - file: {fn}\n"
+                f"  - url : {url}\n"
+                f"  - error: {repr(e)}\n"
+                "You can download manually and place it under:\n"
+                f"  {models_dir}"
+            )
+
+    return models_dir
+
+
+
 
 
 try:
@@ -34,9 +170,42 @@ try:
 except ImportError:
     VideoFromFile = None
 
-def generate_pose_and_mask_videos(ref_video_path, ref_image_path):
+
+def generate_pose_and_mask_videos(ref_video_path, ref_image_path, pose_backend='dwpose', auto_download_dwpose=False, dwpose_fallback=True):
 
     print("Starting online generation of pose and mask videos...")
+
+
+    # Prefer DWPose (ONNX) if requested
+    if str(pose_backend).lower() == 'dwpose':
+        try:
+            print('[DreamID-V] Using DWPose backend')
+            temp_dir = os.path.join(folder_paths.get_temp_directory(), 'dreamidv')
+            os.makedirs(temp_dir, exist_ok=True)
+            video_name = os.path.splitext(os.path.basename(ref_video_path))[0]
+            pose_output_path = os.path.join(temp_dir, video_name + '_pose.mp4')
+            mask_output_path = os.path.join(temp_dir, video_name + '_mask.mp4')
+
+            models_dir = ensure_dwpose_models(auto_download=bool(auto_download_dwpose))
+            det_model_path = os.path.join(models_dir, 'yolox_l.onnx')
+            pose_model_path = os.path.join(models_dir, 'dw-ll_ucoco_384.onnx')
+
+            # Run DWPose extractor (requires onnxruntime)
+            process_dwpose(
+                input_video_path=ref_video_path,
+                output_pose_path=pose_output_path,
+                output_mask_path=mask_output_path,
+                det_model_path=det_model_path,
+                pose_model_path=pose_model_path,
+            )
+            return pose_output_path, mask_output_path
+        except Exception as e:
+            if not dwpose_fallback:
+                raise
+            print(f"[DreamID-V] DWPose failed, fallback to MediaPipe. Error: {repr(e)}")
+
+
+
     detector = FaceMeshDetector()
     get_align_motion = FaceMeshAlign_dreamidv()
     CORE_LANDMARK_INDICES = [
@@ -180,6 +349,9 @@ class RunningHub_DreamID_V_Sampler:
                 "sample_steps": ("INT", {"default": 20,}),
                 "fps": ("INT", {"default": 24,}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "pose_backend": (["dwpose", "mediapipe"], {"default": "dwpose"}),
+                "auto_download_dwpose": ("BOOLEAN", {"default": False}),
+                "dwpose_fallback": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "custom_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8}),
@@ -323,10 +495,26 @@ class RunningHub_DreamID_V_Sampler:
         seed = kwargs.get('seed') ^ (2 ** 32)
         frame_num = kwargs.get('frame_num')
 
+        # Ensure DWPose models exist (even if current pipeline still uses mediapipe)
+        # This gives a clean error message and enables future DWPose backend switch.
+        #auto_download = True
+        auto_download = os.environ.get("DREAMIDV_AUTO_DOWNLOAD_DWPOSE", "0") == "1"
+
+        try:
+            ensure_dwpose_models(auto_download=auto_download)
+        except Exception as e:
+            # Do not hard-fail if you want to keep legacy mediapipe-only flow.
+            # If you DO want to enforce presence, replace print(...) with "raise".
+            print(f"[DreamID-V] DWPose model check warning: {e}")
+
+
         try:
             ref_pose_path, ref_mask_path = generate_pose_and_mask_videos(
                 ref_video_path=ref_video_path,
-                ref_image_path=ref_image_path
+                ref_image_path=ref_image_path,
+                pose_backend=kwargs.get('pose_backend', 'dwpose'),
+                auto_download_dwpose=kwargs.get('auto_download_dwpose', False),
+                dwpose_fallback=kwargs.get('dwpose_fallback', True),
             )
         except:
             raise ValueError("Pose and mask video generation failed. no pose detected in the reference video.")

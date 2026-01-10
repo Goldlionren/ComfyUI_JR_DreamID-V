@@ -45,6 +45,10 @@ This fork is designed to:
 * 🧠 **Low-VRAM Friendly (JR Fork)**
   Flexible device placement for T5 / main model / VAE
 
+* 🕺 **DWPose (ONNX, GPU-Accelerated) Pose Extraction (JR Fork)**  
+  Replaces legacy MediaPipe pose extraction with **DWPose (ONNXRuntime)**.  
+  Supports **CUDA / TensorRT acceleration**, significantly improving stability and accuracy on complex motion videos.
+
 ---
 
 ## 📋 Nodes
@@ -68,6 +72,125 @@ This plugin provides **two sets of nodes**, with **full backward compatibility**
 > 💡 **New workflows should use JR nodes. Existing workflows will continue to work without modification.**
 
 ---
+
+## 🕺 DWPose Pose Backend (JR Enhancement)
+
+This JR fork integrates **DWPose (ONNX-based)** as the **default pose extraction backend**,
+replacing the legacy MediaPipe FaceMesh pipeline.
+
+### Why DWPose?
+
+* ✅ Much higher robustness on fast / complex motions
+* ✅ Fewer "no pose detected" failures
+* ✅ GPU-accelerated via **ONNX Runtime (CUDA / TensorRT)**
+* ✅ Fully independent from PyTorch device placement
+
+---
+
+### Backend Behavior
+
+* **Default backend**: `dwpose`
+* **Automatic fallback**: MediaPipe (if ONNXRuntime or GPU is unavailable)
+* **Device independence**:
+  * T5 can run on **CPU**
+  * DWPose can still run on **GPU**
+  * No cross-interference between PyTorch and ONNXRuntime
+
+---
+
+### Required DWPose Models (ONNX)
+
+Place the following ONNX models under:
+
+```
+ComfyUI/models/DreamID-V/pose/models/
+├── dw-ll_ucoco_384.onnx
+└── yolox_l.onnx
+```
+
+⚠️ These models are **NOT included** in the repository.
+
+---
+
+### Automatic Download (Optional)
+
+JR fork supports **automatic download** of DWPose ONNX models.
+
+Enable by setting the environment variable:
+
+```bash
+DREAMIDV_AUTO_DOWNLOAD_DWPOSE=1
+```
+
+If disabled, a clear error message will indicate which files are missing
+and where to place them.
+
+---
+
+### ONNXRuntime Acceleration
+
+* Supported providers:
+  * `CUDAExecutionProvider`
+  * `TensorrtExecutionProvider` (if available)
+  * `CPUExecutionProvider` (fallback)
+
+Runtime log example:
+
+```
+[DWPose] det providers : ['CUDAExecutionProvider', 'CPUExecutionProvider']
+[DWPose] pose providers: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+---
+
+## 🚀 Usage
+
+1. Install ComfyUI (Python ≥ 3.10 recommended)
+2. Clone this repository into:
+
+```
+ComfyUI/custom_nodes/ComfyUI_JR_DreamID-V
+```
+
+3. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+4. Download required DreamID-V and DWPose models
+5. Launch ComfyUI
+
+> 💡 **Note**:  
+> Selecting `cpu` for **T5** does **NOT** affect DWPose.  
+> Pose extraction runs via **ONNXRuntime** and can still use GPU acceleration.
+
+---
+
+## 🖥️ System Requirements
+
+* OS: Windows / Linux
+* GPU: NVIDIA (16GB VRAM recommended)
+* Python: 3.10+
+* PyTorch: CUDA-enabled build
+* **ONNX Runtime**:
+  * `onnxruntime` (CPU)
+  * `onnxruntime-gpu` (recommended for GPU acceleration)
+
+---
+
+## 🔀 JR Fork Highlights
+
+Compared to the original DreamID-V:
+
+* ✅ DWPose (ONNX) replaces MediaPipe for pose extraction
+* ✅ GPU-accelerated pose detection (CUDA / TensorRT)
+* ✅ Clear separation of T5 / Pose / UNet devices
+* ✅ Improved stability on real-world videos
+
+---
+
+
 
 ## 🛠️ Installation
 
