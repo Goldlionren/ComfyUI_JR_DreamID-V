@@ -52,6 +52,7 @@
 | ---------------------- | ------------------------- |
 | `JR_DreamID-V_Loader`  | 加载 DreamID-V 模型管线（支持设备选择） |
 | `JR_DreamID-V_Sampler` | 执行视频人脸交换采样                |
+| `JR_DreamID-V_LongVideo_Sampler` | **长视频分块采样（推荐用于长视频，避免 OOM）** |
 
 ### 🔁 Legacy 节点（兼容旧 workflow）
 
@@ -61,6 +62,45 @@
 | `RunningHub_DreamID-V_Sampler` | 原始 Sampler（Legacy） |
 
 > 💡 **建议新建工作流时使用 JR 节点，旧 workflow 无需修改即可继续使用。**
+
+---
+
+## 🎞️ 长视频分块采样（JR 增强）
+
+`JR_DreamID-V_LongVideo_Sampler` 用于处理**长视频**（帧数过多时单次推理容易 OOM）。  
+它会把输入视频按固定帧数分块，逐块推理并把输出帧临时写入磁盘，最后合并成一个完整 MP4 输出,显存将不再是你的瓶颈,理论上可以理解为无限长度,最终边界是时间和硬盘。
+
+### 关键参数说明
+
+* **`frame_num`**：**每个 chunk 的帧数（chunk 大小就在这里设置）**。  
+  例如：总 1620 帧，`frame_num=81` → 约 20 个 chunk。
+
+* **`fps`**（仅 LongVideo 节点）：
+  * `-1`（默认）：跟随源视频 FPS（不做重采样）
+  * `>= 1`：在生成 pose/mask 与推理之前执行**按时间的 FPS 重采样**
+    * 保持**原始时长**（不会慢动作）
+    * 显著减少模型需要处理的帧数
+    * 对高 FPS 源视频提速明显（例如 60 → 24）
+
+* **`overlap_frames`**：用于提升 chunk 之间的稳定性（warm-up 重叠帧）。  
+  对于 `i>0` 的 chunk，会从上一段末尾借 `overlap_frames` 帧作为“稳定输入”，
+  但在输出时会**丢弃重叠部分**，避免重复帧。
+
+* **`return_frames_as_images` / `max_frames_to_return`**：可选返回帧张量（长视频不建议开启）。  
+  更推荐使用 `frames_dir` 作为下游输入。
+
+* **`keep_temp`**：是否保留中间 chunk 文件（便于调试，默认清理）。
+
+### 输出说明
+
+* **`video`**：最终合成的 MP4（音频从原始输入视频 mux）
+* **`frames_dir`**：合并后的 PNG 帧目录（`frame_%08d.png`），推荐下游使用
+* **`frames`**：可选 IMAGE 批量输出（受 `max_frames_to_return` 限制）
+
+### 依赖要求
+
+该节点依赖 **FFmpeg / FFprobe** 做探测、裁剪与编码，请确保系统 `PATH` 中可直接调用：
+`ffmpeg`、`ffprobe`。
 
 ---
 

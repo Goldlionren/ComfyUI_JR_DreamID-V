@@ -9,6 +9,10 @@ import warnings
 import uuid
 import subprocess
 
+import math
+import glob
+import gc
+
 import urllib.request
 import shutil
 
@@ -97,69 +101,7 @@ def ensure_dwpose_models(auto_download: bool = False, timeout: int = 30) -> str:
 
 
 
-DWPOSE_FILES = {
-    "dw-ll_ucoco_384.onnx": "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx",
-    "yolox_l.onnx": "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx",
-}
 
-def _dwpose_models_dir():
-    # ComfyUI/models/DreamID-V/pose/models
-    return os.path.join(folder_paths.models_dir, "DreamID-V", "pose", "models")
-
-def ensure_dwpose_models(auto_download: bool = True) -> str:
-    """
-    Ensure DWPose ONNX models exist in ComfyUI models directory.
-    Returns the models directory path.
-    """
-    models_dir = _dwpose_models_dir()
-    os.makedirs(models_dir, exist_ok=True)
-
-    missing = []
-    for fn in DWPOSE_FILES.keys():
-        if not os.path.exists(os.path.join(models_dir, fn)):
-            missing.append(fn)
-
-    if not missing:
-        return models_dir
-
-    if not auto_download:
-        raise FileNotFoundError(
-            "Missing DWPose model files:\n"
-            f"  - {', '.join(missing)}\n"
-            "Please place them under:\n"
-            f"  {models_dir}\n"
-            "Or enable auto-download in node settings."
-        )
-
-    # Auto-download missing files (atomic write via temp file + move)
-    for fn in missing:
-        url = DWPOSE_FILES[fn]
-        dst = os.path.join(models_dir, fn)
-        tmp = dst + ".download"
-        try:
-            print(f"[DreamID-V] DWPose model missing: {dst}")
-            print(f"[DreamID-V] Downloading from: {url}")
-            with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f)
-            os.replace(tmp, dst)
-            print(f"[DreamID-V] Downloaded: {dst}")
-        except Exception as e:
-            # cleanup temp
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            raise RuntimeError(
-                "Failed to auto-download DWPose model:\n"
-                f"  - file: {fn}\n"
-                f"  - url : {url}\n"
-                f"  - error: {repr(e)}\n"
-                "You can download manually and place it under:\n"
-                f"  {models_dir}"
-            )
-
-    return models_dir
 
 
 
@@ -169,6 +111,196 @@ try:
     from comfy_api.input_impl.video_types import VideoFromFile
 except ImportError:
     VideoFromFile = None
+
+
+
+
+
+def _which_bin(name: str) -> str:
+    p = shutil.which(name)
+    if not p:
+        raise RuntimeError(f"Required binary not found in PATH: {name}")
+    return p
+
+def _run_cmd(cmd: list[str], timeout: int | None = None) -> str:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\n\nSTDOUT:\n{p.stdout}\n\nSTDERR:\n{p.stderr}"
+        )
+    return (p.stdout or "").strip()
+
+def _ffprobe_fps_and_total_frames(video_path: str) -> tuple[float, int]:
+    """
+    Returns (fps, total_frames). Uses ffprobe; falls back to counted frames if nb_frames is unavailable.
+    """
+    ffprobe = _which_bin("ffprobe")
+
+    fps_txt = _run_cmd([
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate",
+        "-of", "default=nk=1:nw=1",
+        video_path
+    ])
+    if "/" in fps_txt:
+        a, b = fps_txt.split("/", 1)
+        fps = float(a) / float(b)
+    else:
+        fps = float(fps_txt)
+
+    nb_frames_txt = _run_cmd([
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames",
+        "-of", "default=nk=1:nw=1",
+        video_path
+    ])
+
+    total_frames = -1
+    if nb_frames_txt and nb_frames_txt != "N/A":
+        try:
+            total_frames = int(nb_frames_txt)
+        except Exception:
+            total_frames = -1
+
+    if total_frames <= 0:
+        count_txt = _run_cmd([
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nk=1:nw=1",
+            video_path
+        ])
+        total_frames = int(count_txt)
+
+    return fps, total_frames
+
+def _ensure_dir(p: str) -> str:
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def _soft_empty_cache():
+    """
+    Aggressive cleanup between chunks to prevent VRAM fragmentation / accumulation.
+    """
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    try:
+        import comfy.model_management as mm
+        mm.soft_empty_cache()
+    except Exception:
+        pass
+
+def _cut_video_by_frame_range(src_video: str, dst_video: str, start_frame: int, frame_count: int) -> None:
+    """
+    Frame-accurate cut using select=between(n,start,end). Outputs a video with frames re-timestamped from 0.
+    """
+    ffmpeg = _which_bin("ffmpeg")
+    _ensure_dir(os.path.dirname(dst_video))
+    end_frame = start_frame + frame_count - 1
+    vf = f"select='between(n\\,{start_frame}\\,{end_frame})',setpts=PTS-STARTPTS"
+    _run_cmd([
+        ffmpeg, "-v", "error", "-y",
+        "-i", src_video,
+        "-vf", vf,
+        "-vsync", "0",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        dst_video
+    ])
+
+def _extract_png_frames_from_video(src_video: str, dst_dir: str) -> None:
+    """
+    Extract all frames from src_video into dst_dir/frame_%08d.png (0-based contiguous index after extraction).
+    """
+    ffmpeg = _which_bin("ffmpeg")
+    _ensure_dir(dst_dir)
+    # -start_number 0 ensures consistent indexing
+    _run_cmd([
+        ffmpeg, "-v", "error", "-y",
+        "-i", src_video,
+        "-vsync", "0",
+        "-start_number", "0",
+        os.path.join(dst_dir, "frame_%08d.png"),
+    ])
+
+def _encode_video_from_png_frames(frames_dir: str, fps: float, out_path: str) -> None:
+    """
+    Encode frames_dir/frame_%08d.png into out_path (no audio).
+    """
+    ffmpeg = _which_bin("ffmpeg")
+    _ensure_dir(os.path.dirname(out_path))
+    _run_cmd([
+        ffmpeg, "-v", "error", "-y",
+        "-framerate", str(fps),
+        "-i", os.path.join(frames_dir, "frame_%08d.png"),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        out_path
+    ])
+
+def _mux_audio_from_source(video_no_audio: str, source_video: str, out_path: str) -> None:
+    """
+    Copy audio (if any) from source_video to video_no_audio.
+    """
+    ffmpeg = _which_bin("ffmpeg")
+    ffprobe = _which_bin("ffprobe")
+    _ensure_dir(os.path.dirname(out_path))
+
+    has_audio = False
+    try:
+        probe_cmd = [
+            ffprobe, "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "a:0", source_video
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            import json
+            info = json.loads(result.stdout)
+            if info.get("streams"):
+                has_audio = True
+    except Exception:
+        has_audio = False
+
+    if has_audio:
+        cmd = [
+            ffmpeg, "-v", "error", "-y",
+            "-i", video_no_audio,
+            "-i", source_video,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-shortest",
+            out_path
+        ]
+    else:
+        cmd = [
+            ffmpeg, "-v", "error", "-y",
+            "-i", video_no_audio,
+            "-c:v", "copy",
+            out_path
+        ]
+    _run_cmd(cmd)
+
+
+
+
+
 
 
 def generate_pose_and_mask_videos(ref_video_path, ref_image_path, pose_backend='dwpose', auto_download_dwpose=False, dwpose_fallback=True):
@@ -345,9 +477,10 @@ class RunningHub_DreamID_V_Sampler:
                 "video": ("VIDEO", ),
                 "ref_image": ("IMAGE", ),
                 "size": (["832*480", "1280*720", "480*832", "720*1280", "custom"], {"default": "832*480"}),
-                "frame_num": ("INT", {"default": 81, "min": 1, 'step': 4}),
+                "frame_num": ("INT", {"default": 81, "min": 1, 'step': 1}),
                 "sample_steps": ("INT", {"default": 20,}),
-                "fps": ("INT", {"default": 24,}),
+                # fps for output video (short sampler does not support auto)
+                "fps": ("INT", {"default": 24, "min": 1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "pose_backend": (["dwpose", "mediapipe"], {"default": "dwpose"}),
                 "auto_download_dwpose": ("BOOLEAN", {"default": False}),
@@ -382,6 +515,9 @@ class RunningHub_DreamID_V_Sampler:
             output_path: Output video file path
         """
         temp_video_path = output_path.replace('.mp4', '_temp.mp4')
+
+        ffmpeg = _which_bin("ffmpeg")
+        ffprobe = _which_bin("ffprobe")
         
         # Convert tensor to numpy frames
         frames_np = (frames_tensor.cpu().numpy() * 255).astype(np.uint8)
@@ -406,7 +542,7 @@ class RunningHub_DreamID_V_Sampler:
         has_audio = False
         try:
             probe_cmd = [
-                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                ffprobe, '-v', 'quiet', '-print_format', 'json',
                 '-show_streams', '-select_streams', 'a:0', source_video_path
             ]
             result = subprocess.run(probe_cmd, capture_output=True, text=True)
@@ -422,7 +558,7 @@ class RunningHub_DreamID_V_Sampler:
         if has_audio:
             print(f"[DreamID-V] Copying audio from source video...")
             cmd = [
-                'ffmpeg', '-y',
+                ffmpeg, '-y',
                 '-i', temp_video_path,
                 '-i', source_video_path,
                 '-c:v', 'libx264',
@@ -437,7 +573,7 @@ class RunningHub_DreamID_V_Sampler:
         else:
             print(f"[DreamID-V] No audio in source video, encoding video only...")
             cmd = [
-                'ffmpeg', '-y',
+                ffmpeg, '-y',
                 '-i', temp_video_path,
                 '-c:v', 'libx264',
                 '-preset', 'fast',
@@ -446,10 +582,11 @@ class RunningHub_DreamID_V_Sampler:
             ]
         
         try:
-            process = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if process.returncode != 0:
-                print(f"[DreamID-V] FFmpeg error: {process.stderr}")
-                raise RuntimeError(f"FFmpeg failed: {process.stderr}")
+#            process = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+#            if process.returncode != 0:
+#                print(f"[DreamID-V] FFmpeg error: {process.stderr}")
+#                raise RuntimeError(f"FFmpeg failed: {process.stderr}")
+            _run_cmd(cmd, timeout=300)
             print(f"[DreamID-V] Video created successfully: {output_path}")
         except subprocess.TimeoutExpired:
             raise RuntimeError("Video encoding timed out")
@@ -561,6 +698,332 @@ class RunningHub_DreamID_V_Sampler:
     def update(self):
         self.pbar.update(1)
 
+######按时间换算fps###########
+def _resample_video_to_fps(src_video: str, fps_out: float, work_dir: str) -> str:
+    """
+    Resample video to target fps using time-based downsampling.
+    Returns path to the resampled video.
+    """
+    ffmpeg = _which_bin("ffmpeg")
+    _ensure_dir(work_dir)
+
+    out_path = os.path.join(
+        work_dir,
+        f"resampled_fps{int(round(fps_out))}_{os.path.basename(src_video)}"
+    )
+
+    if os.path.exists(out_path):
+        return out_path
+
+    cmd = [
+        ffmpeg, "-v", "error", "-y",
+        "-i", src_video,
+        "-vf", f"fps={fps_out}",
+        "-fps_mode", "cfr",
+        "-r", str(fps_out),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        out_path
+    ]
+    _run_cmd(cmd)
+    return out_path
+
+#############################
+
+class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
+    """
+    Long video chunking sampler:
+      - probe total frames
+      - generate full pose/mask once (or fallback)
+      - cut source/mask/pose into per-chunk short videos
+      - run pipeline.generate per chunk
+      - write per-chunk output frames to disk
+      - merge into final mp4 and mux original audio
+
+    Outputs:
+      - frames (optional; risky for very long videos)
+      - video
+      - frames_dir (string path; recommended for downstream processing)
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        base = super().INPUT_TYPES()
+        # LongVideo only: fps = -1 means "follow source video fps"
+        # (We do NOT change short sampler's fps default)
+        base["required"]["fps"] = ("INT", {"default": -1, "min": -1})        
+        # extend required / optional
+        base["required"].update({
+            "return_frames_as_images": ("BOOLEAN", {"default": False}),
+            "max_frames_to_return": ("INT", {"default": 300, "min": 0, "max": 100000}),
+            "keep_temp": ("BOOLEAN", {"default": False}),
+            # overlap (warm-up) frames: chunk i>0 will prepend these frames from previous chunk,
+            # but we will DROP them from output to avoid duplicate frames.
+            "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 256}),
+        })
+        base["optional"].update({
+            "temp_subdir": ("STRING", {"default": "dreamidv_long"}),
+        })
+        return base
+
+    RETURN_TYPES = ('IMAGE', 'VIDEO', 'STRING')
+    RETURN_NAMES = ('frames', 'video', 'frames_dir')
+    FUNCTION = "sample_long"
+    CATEGORY = "JR/DreamID-V"
+    OUTPUT_NODE = True
+
+    def _job_dirs(self, temp_subdir: str):
+        root = os.path.join(folder_paths.get_temp_directory(), temp_subdir)
+        job_id = uuid.uuid4().hex[:10]
+        job_dir = _ensure_dir(os.path.join(root, f"job_{job_id}"))
+        chunks_dir = _ensure_dir(os.path.join(job_dir, "chunks"))
+        out_frames_dir = _ensure_dir(os.path.join(job_dir, "out_frames"))
+        return job_dir, chunks_dir, out_frames_dir
+
+    def _save_tensor_frames_to_dir(self, frames_tensor: torch.Tensor, out_dir: str, start_index: int) -> int:
+        """
+        frames_tensor: (N,H,W,C) in [0,1]
+        Returns next start_index after saving.
+        """
+        _ensure_dir(out_dir)
+        frames_np = (frames_tensor.detach().cpu().float().clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+        n = frames_np.shape[0]
+        for i in range(n):
+            img = Image.fromarray(frames_np[i])
+            img.save(os.path.join(out_dir, f"frame_{start_index:08d}.png"))
+            start_index += 1
+        return start_index
+
+    def sample_long(self, **kwargs):
+        # reuse the same params & defaults as sample()
+        pipeline = kwargs.get('pipeline')
+        sample_steps = kwargs.get('sample_steps')
+        fps_ui = kwargs.get('fps')
+        size = kwargs.get('size')
+        frame_num = kwargs.get('frame_num')  # chunk size
+        seed_base = kwargs.get('seed') ^ (2 ** 32)
+        overlap_frames = int(kwargs.get("overlap_frames", 8) or 0)
+
+        return_frames_as_images = kwargs.get("return_frames_as_images", False)
+        max_frames_to_return = int(kwargs.get("max_frames_to_return", 300))
+        keep_temp = bool(kwargs.get("keep_temp", False))
+        temp_subdir = kwargs.get("temp_subdir", "dreamidv_long")
+
+        # progress bar: we cannot know total steps precisely (chunks * (steps+1)) until probing video
+        # We'll create per-chunk progress bars instead.
+
+        orig_video_path = kwargs.get('video').get_stream_source()
+        ref_video_path = orig_video_path
+
+
+        ref_image = self.tensor_2_pil(kwargs.get('ref_image'))
+        ref_image_path = os.path.join(folder_paths.get_temp_directory(), f'dreamidv_{uuid.uuid4()}.png')
+        ref_image.save(ref_image_path)
+
+        if size == 'custom':
+            custom_width = kwargs.get('custom_width', 832)
+            custom_height = kwargs.get('custom_height', 480)
+            size_tuple = (custom_width, custom_height)
+        else:
+            size_tuple = SIZE_CONFIGS[size]
+
+        # Probe source video
+        fps_src, total_frames = _ffprobe_fps_and_total_frames(ref_video_path)
+        # fps_ui is INT; treat <0 (default -1) as "follow source fps"
+        fps_ui = int(fps_ui) if fps_ui is not None else -1
+        fps = float(fps_src) if fps_ui < 0 else float(fps_ui)
+
+        # Time-based fps resampling BEFORE pose/mask and inference
+        if fps_ui >= 1 and abs(fps - fps_src) > 1e-3:
+            print(f"[DreamID-V][Long] Resampling video by time: {fps_src:.3f} -> {fps:.3f} fps")
+            ref_video_path = _resample_video_to_fps(
+                ref_video_path,
+                fps_out=fps,
+                work_dir=os.path.join(folder_paths.get_temp_directory(), "dreamidv_resample")
+            )
+            fps_src, total_frames = _ffprobe_fps_and_total_frames(ref_video_path)
+            print(f"[DreamID-V][Long] Resampled video fps={fps_src:.3f} frames={total_frames}")
+
+        # IMPORTANT: compute chunks AFTER resample (total_frames may change)
+        num_chunks = int(math.ceil(total_frames / float(frame_num)))
+        print(f"[DreamID-V][Long] source={orig_video_path}")
+        if ref_video_path != orig_video_path:
+            print(f"[DreamID-V][Long] infer_video={ref_video_path}")
+        print(
+            f"[DreamID-V][Long] fps(src)={fps_src:.3f} fps(out)={fps:.3f} "
+            f"total_frames={total_frames} chunk_size={frame_num} chunks={num_chunks}"
+        )
+
+        # Ensure DWPose models exist (optional)
+        auto_download = os.environ.get("DREAMIDV_AUTO_DOWNLOAD_DWPOSE", "0") == "1"
+        try:
+            ensure_dwpose_models(auto_download=auto_download)
+        except Exception as e:
+            print(f"[DreamID-V] DWPose model check warning: {e}")
+
+        # Generate pose/mask ONCE for full video, then cut per chunk to match.
+        try:
+            ref_pose_path, ref_mask_path = generate_pose_and_mask_videos(
+                ref_video_path=ref_video_path,
+                ref_image_path=ref_image_path,
+                pose_backend=kwargs.get('pose_backend', 'dwpose'),
+                auto_download_dwpose=kwargs.get('auto_download_dwpose', False),
+                dwpose_fallback=kwargs.get('dwpose_fallback', True),
+            )
+        except Exception:
+            raise ValueError("Pose and mask video generation failed. no pose detected in the reference video.")
+
+        # Setup temp job dirs
+        job_dir, chunks_dir, out_frames_dir = self._job_dirs(temp_subdir)
+
+        text_prompt = 'change face'
+        sample_shift = 5.0
+        sample_solver = 'unipc'
+        sample_guide_scale_img = 4.0
+
+        global_out_index = 0
+
+        # Process chunks
+        for ci in range(num_chunks):
+            start = ci * frame_num
+            count = min(frame_num, total_frames - start)
+
+            print(f"[DreamID-V][Long] chunk {ci+1}/{num_chunks} start_frame={start} count={count}")
+
+            # Overlap scheme (Option 1):
+            # - For ci>0, we prepend overlap_frames from previous chunk (warm-up),
+            # - but drop those overlapped frames from the OUTPUT to avoid duplicates.
+            # Compute the actual cut range and the number of frames to drop in output.
+            if ci > 0 and overlap_frames > 0:
+                cut_start = max(0, start - overlap_frames)
+                # If start is very small (edge case), actual overlap may be smaller than requested
+                drop = start - cut_start
+                cut_count = count + drop
+            else:
+                cut_start = start
+                drop = 0
+                cut_count = count
+
+            # Per-chunk temp videos
+            chunk_dir = os.path.join(chunks_dir, f"chunk_{ci:05d}")
+            _ensure_dir(chunk_dir)
+            chunk_src = os.path.join(chunk_dir, "src.mp4")
+            chunk_pose = os.path.join(chunk_dir, "pose.mp4")
+            chunk_mask = os.path.join(chunk_dir, "mask.mp4")
+
+            # Cut source/pose/mask by frame range (frame-accurate)
+            _cut_video_by_frame_range(ref_video_path, chunk_src, cut_start, cut_count)
+            _cut_video_by_frame_range(ref_pose_path, chunk_pose, cut_start, cut_count)
+            _cut_video_by_frame_range(ref_mask_path, chunk_mask, cut_start, cut_count)
+
+            # Update pipeline fps per UI
+            pipeline.config.sample_fps = int(fps)
+
+            # progress per chunk
+            self.pbar = comfy.utils.ProgressBar(sample_steps + 1)
+
+            # Fixed seed across chunks to reduce identity/style drift
+            seed = seed_base & 0xFFFFFFFFFFFFFFFF
+
+            ref_paths = [chunk_src, chunk_mask, ref_image_path, chunk_pose]
+
+            # Run generation for this chunk
+            generated = pipeline.generate(
+                text_prompt,
+                ref_paths,
+                size=size_tuple,
+                frame_num=cut_count,
+                shift=sample_shift,
+                sample_solver=sample_solver,
+                sampling_steps=sample_steps,
+                guide_scale_img=sample_guide_scale_img,
+                seed=seed,
+                update_fn=self.update
+            )
+
+            # generated: (C, T, H, W)? existing code assumes (C,T,H,W) and converts to (T,H,W,C)
+            frames = (generated.clamp(-1, 1).cpu().permute(1, 2, 3, 0) + 1.0) / 2.0
+
+            # Drop overlapped warm-up frames from OUTPUT to avoid duplicates
+            if drop > 0:
+                frames_to_save = frames[drop:]
+            else:
+                frames_to_save = frames
+
+            # Save frames to disk in a single global index space
+            global_out_index = self._save_tensor_frames_to_dir(frames_to_save, out_frames_dir, global_out_index)
+
+            # Cleanup to avoid OOM in next chunk
+            try:
+                del generated
+                del frames
+                del frames_to_save
+            except Exception:
+                pass
+            _soft_empty_cache()
+
+            # Remove per-chunk temp to save disk
+            if not keep_temp:
+                try:
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            _soft_empty_cache()
+
+        # Encode final video from PNG frames
+        output_dir = folder_paths.get_output_directory()
+        out_no_audio = os.path.join(output_dir, f"dreamidv_long_{uuid.uuid4()}.mp4")
+        out_final = out_no_audio  # will be overwritten if audio mux is successful
+
+        _encode_video_from_png_frames(out_frames_dir, fps=fps, out_path=out_no_audio)
+
+        # mux audio from source
+        try:
+            out_muxed = os.path.join(output_dir, f"dreamidv_long_audio_{uuid.uuid4()}.mp4")
+            _mux_audio_from_source(out_no_audio, orig_video_path, out_muxed)
+            # if mux ok, prefer muxed output and remove no-audio
+            out_final = out_muxed
+            try:
+                os.remove(out_no_audio)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[DreamID-V][Long] audio mux failed, using no-audio video. Error: {repr(e)}")
+
+        video_obj = self.create_video_object(out_final)
+
+        # Optional: return frames as IMAGE batch (risk for long videos)
+        frames_tensor_out = None
+        if return_frames_as_images:
+            if max_frames_to_return <= 0:
+                print("[DreamID-V][Long] return_frames_as_images=True but max_frames_to_return<=0; skipping frames output.")
+            elif total_frames > max_frames_to_return:
+                print(f"[DreamID-V][Long] total_frames={total_frames} exceeds max_frames_to_return={max_frames_to_return}; skipping frames output.")
+            else:
+                # Load back PNGs to tensor (memory heavy; only allowed under limit)
+                pngs = sorted(glob.glob(os.path.join(out_frames_dir, "frame_*.png")))
+                imgs = []
+                for p in pngs:
+                    im = Image.open(p).convert("RGB")
+                    arr = np.asarray(im).astype(np.float32) / 255.0
+                    imgs.append(arr)
+                if imgs:
+                    frames_tensor_out = torch.from_numpy(np.stack(imgs, axis=0))
+
+        # Cleanup temp job dir if requested.
+        # IMPORTANT: keep out_frames_dir if we are returning it for downstream nodes.
+        # When keep_temp=False, we only remove per-chunk intermediates (chunks_dir),
+        # leaving out_frames_dir intact.
+        if not keep_temp:
+            try:
+                shutil.rmtree(chunks_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        return (frames_tensor_out, video_obj, out_frames_dir)
+
 
 
 
@@ -571,15 +1034,22 @@ class JR_DreamID_V_Loader(RunningHub_DreamID_V_Loader):
 class JR_DreamID_V_Sampler(RunningHub_DreamID_V_Sampler):
     CATEGORY = "JR/DreamID-V"
 
+class JR_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_LongVideo_Sampler):
+    CATEGORY = "JR/DreamID-V"
+
+
+
+
 
 NODE_CLASS_MAPPINGS = {
     # Legacy keys: keep for old workflows
     "RunningHub_DreamID-V_Loader": RunningHub_DreamID_V_Loader,
     "RunningHub_DreamID-V_Sampler": RunningHub_DreamID_V_Sampler,
-
+    
     # JR keys: new workflows should use these
-    "JR_DreamID-V_Loader": RunningHub_DreamID_V_Loader,
-    "JR_DreamID-V_Sampler": RunningHub_DreamID_V_Sampler,
+    "JR_DreamID-V_Loader": JR_DreamID_V_Loader,
+    "JR_DreamID-V_Sampler": JR_DreamID_V_Sampler,
+    "JR_DreamID-V_LongVideo_Sampler": JR_DreamID_V_LongVideo_Sampler,    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -587,4 +1057,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RunningHub_DreamID-V_Sampler": "RunningHub DreamID-V Sampler (Legacy)",
     "JR_DreamID-V_Loader": "JR DreamID-V Loader",
     "JR_DreamID-V_Sampler": "JR DreamID-V Sampler",
+    "JR_DreamID-V_LongVideo_Sampler": "JR DreamID-V Long Video Sampler (Chunked)",
 }

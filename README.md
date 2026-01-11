@@ -61,6 +61,7 @@ This plugin provides **two sets of nodes**, with **full backward compatibility**
 | ---------------------- | ------------------------------------------- |
 | `JR_DreamID-V_Loader`  | Load DreamID-V pipeline (device-selectable) |
 | `JR_DreamID-V_Sampler` | Run video face swapping                     |
+| `JR_DreamID-V_LongVideo_Sampler` | Run long video face swapping via chunking (recommended for long videos)|
 
 ### 🔁 Legacy Nodes (Compatibility)
 
@@ -69,7 +70,47 @@ This plugin provides **two sets of nodes**, with **full backward compatibility**
 | `RunningHub_DreamID-V_Loader`  | Legacy loader (for old workflows) |
 | `RunningHub_DreamID-V_Sampler` | Legacy sampler                    |
 
+
 > 💡 **New workflows should use JR nodes. Existing workflows will continue to work without modification.**
+
+---
+
+## 🎞️ Long Video (Chunked) Sampler (JR Enhancement)
+
+`JR_DreamID-V_LongVideo_Sampler` is designed for **long videos** that would otherwise OOM when processed as a single clip.
+It splits the input into chunks, processes each chunk sequentially, writes intermediate frames to disk, and finally merges them into a single output video.
+
+### Key Parameters
+
+* **`frame_num`**: **Chunk size in frames**.  
+  Example: total 1620 frames, `frame_num=81` → 20 chunks.
+
+* **`fps`** (LongVideo only):
+  * `-1` (default): follow source video FPS (no resampling)
+  * `>= 1`: **time-based FPS resampling before pose/mask and inference**
+    * Keeps the **original duration** (no slow-motion)
+    * Reduces the number of frames processed by the model
+    * Significantly improves speed for high-FPS sources (e.g., 60 → 24)
+
+* **`overlap_frames`**: Warm-up overlap for temporal stability.  
+  For chunk `i>0`, prepend `overlap_frames` frames from the end of the previous chunk **for stability only**,
+  but **drop overlapped frames from the output** to avoid duplicates.
+
+* **`return_frames_as_images` / `max_frames_to_return`**: Optional frame tensor output.  
+  Recommended to keep disabled for long videos; use `frames_dir` instead.
+
+* **`keep_temp`**: Keep intermediate chunk files on disk for debugging.
+
+### Outputs
+
+* **`video`**: Final merged MP4 (audio is muxed from the original input video)
+* **`frames_dir`**: Directory containing merged PNG frames (`frame_%08d.png`) for downstream processing
+* **`frames`**: Optional IMAGE batch (guarded by `max_frames_to_return`)
+
+### Requirements
+
+This node uses **FFmpeg/FFprobe** for probing, cutting and encoding.  
+Make sure `ffmpeg` and `ffprobe` are available in your system `PATH`.
 
 ---
 
