@@ -302,6 +302,38 @@ ComfyUI/models/DreamID-V/
 └── dreamidv.pth
 ```
 
+### 3. DreamID-V Wan-Faster 模型（`wan_faster` 必需）
+
+如果你计划使用 **Wan-Faster 后端**，还需要额外下载一个模型文件。
+
+#### 下载地址
+
+请从 DreamID-V 原项目下载 **`dreamidv_faster.pth`**：
+
+👉 https://github.com/bytedance/DreamID-V  
+（参考原仓库 README 中的 **Wan-1.3B-Faster** 说明）
+
+> ⚠️ 本仓库 **不包含** `dreamidv_faster.pth`，  
+> 请务必从原作者仓库自行下载。
+
+#### 放置路径
+
+放置路径：
+
+```
+ComfyUI/models/DreamID-V/
+├── dreamidv.pth
+└── dreamidv_faster.pth
+```
+#### 使用说明
+
+- `dreamidv_faster.pth` **仅在使用以下配置时才会加载**：backend = wan_faster
+- 标准模式（`wan`）仍然使用 `dreamidv.pth`
+- Loader 会根据所选 backend 自动加载对应模型文件
+
+
+
+
 ---
 
 ## 🚀 使用方法（JR 推荐）

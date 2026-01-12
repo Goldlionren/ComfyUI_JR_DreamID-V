@@ -316,6 +316,39 @@ ComfyUI/models/DreamID-V/
 └── dreamidv.pth
 ```
 
+### 3. DreamID-V Wan-Faster Model (Required for `wan_faster` backend)
+
+If you plan to use the **Wan-Faster backend**, an additional model file is required.
+
+#### Download
+
+Download **`dreamidv_faster.pth`** from the official DreamID-V repository:
+
+👉 https://github.com/bytedance/DreamID-V  
+(See the **Wan-1.3B-Faster** section in the upstream README)
+
+> ⚠️ This repository does **NOT** redistribute `dreamidv_faster.pth`.
+> Please download it directly from the original authors.
+
+#### Placement
+
+Directory:
+
+```
+ComfyUI/models/DreamID-V/
+├── dreamidv.pth
+└── dreamidv_faster.pth
+```
+
+#### Usage Notes
+
+- `dreamidv_faster.pth` is **only required** when using:
+backend = wan_faster
+
+- The standard backend (`wan`) continues to use `dreamidv.pth`
+- The loader will automatically select the correct checkpoint
+based on the selected backend
+
 ---
 
 ## 🚀 Usage (JR Recommended)
