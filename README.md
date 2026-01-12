@@ -74,6 +74,25 @@ This plugin provides **two sets of nodes**, with **full backward compatibility**
 > 💡 **New workflows should use JR nodes. Existing workflows will continue to work without modification.**
 
 ---
+## ⚡ DreamID-V Wan-Faster Backend (JR Integrated)
+
+This fork integrates **DreamID-V Wan-1.3B-Faster** as an optional backend,
+providing **significantly faster inference** with reduced sampling steps,
+while maintaining identity fidelity.
+
+### Recommended Settings (Wan-Faster)
+
+| Parameter        | Recommended | Notes |
+|------------------|-------------|-------|
+| `backend`        | `wan_faster` | Must be explicitly selected in Sampler |
+| `sampling_steps`| **12**        | Faster model is trained for short schedules |
+| `fps` (LongVideo)| **16**        | Strong speed / quality balance |
+| `sample_solver` | `unipc`       | **Required** (others not supported) |
+| `frame_num`     | 81            | Same as standard DreamID-V |
+| `overlap_frames`| 8–12          | Recommended for long videos |
+
+> ⚠️ Using higher sampling steps (e.g. 20+) with `wan_faster` provides **no quality benefit** and only increases runtime.
+---
 
 ## 🎞️ Long Video (Chunked) Sampler (JR Enhancement)
 
@@ -84,6 +103,9 @@ It splits the input into chunks, processes each chunk sequentially, writes inter
 
 * **`frame_num`**: **Chunk size in frames**.  
   Example: total 1620 frames, `frame_num=81` → 20 chunks.
+> 💡 **Wan-Faster Recommendation**:  
+> When using `backend=wan_faster`, `fps=16` is strongly recommended for optimal speed/quality tradeoff.
+
 
 * **`fps`** (LongVideo only):
   * `-1` (default): follow source video FPS (no resampling)
@@ -327,6 +349,28 @@ ComfyUI/models/DreamID-V/
 > ⚠️ Larger VRAM improves performance, but **4090 / 5090 are NOT required**.
 
 ---
+## 🚀 Using Wan-Faster Backend (Recommended)
+
+1. Add **`JR_DreamID-V_Loader`**
+2. Add **`JR_DreamID-V_Sampler`** or **`JR_DreamID-V_LongVideo_Sampler`**
+3. In the **Sampler** node:
+   * Set **`backend` = `wan_faster`**
+   * Set **`sampling_steps` = 12**
+   * Ensure **`sample_solver` = unipc**
+4. (LongVideo only) Set:
+   * **`fps = 16`** (recommended)
+5. Run the workflow
+
+### Notes
+
+* `wan_faster` **does not use pose reference video** internally.
+* Reference inputs are limited to:
+  * source video
+  * face mask video
+  * reference image
+* Progress is reported via ComfyUI’s native green progress bar.
+
+---
 
 ## 📝 License & Fork Statement
 
@@ -348,7 +392,9 @@ All modifications in this repository are made under the terms of Apache-2.0.
 * Wan Team
 * ComfyUI
 * Original RunningHub project authors
-
+>**Special thanks to the original DreamID-V authors for introducing the**
+>**Wan-1.3B-Faster** **model and inference pipeline, which enables**
+>**significantly faster generation with reduced sampling steps.**
 ---
 
 ## ⚠️ Disclaimer

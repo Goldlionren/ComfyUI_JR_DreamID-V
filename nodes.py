@@ -22,8 +22,14 @@ import torch, random
 import torch.distributed as dist
 from PIL import Image, ImageOps
 
-from .dreamidv_wan import DreamIDV
-from .dreamidv_wan.configs import WAN_CONFIGS, SIZE_CONFIGS, MAX_AREA_CONFIGS, SUPPORTED_SIZES
+# classic backend
+from .dreamidv_wan import DreamIDV as DreamIDV_WAN
+from .dreamidv_wan.configs import WAN_CONFIGS as WAN_CONFIGS_WAN, SIZE_CONFIGS, MAX_AREA_CONFIGS, SUPPORTED_SIZES
+
+# faster backend
+from . import dreamidv_wan_faster
+from .dreamidv_wan_faster.configs import WAN_CONFIGS as WAN_CONFIGS_FASTER
+
 from .dreamidv_wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from .dreamidv_wan.utils.utils import cache_video, cache_image, str2bool
 
@@ -410,12 +416,37 @@ def generate_pose_and_mask_videos(ref_video_path, ref_image_path, pose_backend='
     )
     return pose_output_path, mask_output_path
 
+
+import inspect
+
+def _pipeline_generate_compat(pipeline, text_prompt, ref_paths, **gen_kwargs):
+    """
+    Best-effort call pipeline.generate() across WAN and WAN_FASTER:
+    only passes kwargs that the target generate() actually accepts.
+    """
+    fn = getattr(pipeline, "generate", None)
+    if fn is None:
+        raise RuntimeError("Pipeline has no generate()")
+
+    try:
+        sig = inspect.signature(fn)
+        accepted = set(sig.parameters.keys())
+        filtered = {k: v for k, v in gen_kwargs.items() if k in accepted}
+    except Exception:
+        filtered = dict(gen_kwargs)
+
+    return fn(text_prompt, ref_paths, **filtered)
+
+
+
 class RunningHub_DreamID_V_Loader:
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
+                "backend": (["wan", "wan_faster"], {"default": "wan"}),
+                "main_device": (["cuda:0", "cuda:1"], {"default": "cuda:0"}),
                 "t5_device": (["cpu", "cuda:0", "cuda:1"], {"default": "cpu"}),
             }
         }
@@ -426,44 +457,67 @@ class RunningHub_DreamID_V_Loader:
     CATEGORY = "RunningHub/DreamID-V"
     OUTPUT_NODE = True
 
-    def load(self, t5_device="cpu", **kwargs):
+    def load(self, t5_device="cpu", backend="wan", main_device="cuda:0", **kwargs):
         task = 'swapface'
         ckpt_dir = os.path.join(folder_paths.models_dir, 'Wan', 'Wan2.1-T2V-1.3B')
-        dreamidv_ckpt = os.path.join(folder_paths.models_dir, 'DreamID-V', 'dreamidv.pth')
 
-        cfg0 = WAN_CONFIGS[task]
-
-        # 1) copy
-        if isinstance(cfg0, dict):
-            cfg_dict = dict(cfg0)   # shallow copy
+        if backend == "wan_faster":
+            dreamidv_ckpt = os.path.join(folder_paths.models_dir, 'DreamID-V', 'dreamidv_faster.pth')
+            cfg0 = WAN_CONFIGS_FASTER[task]
         else:
-            # if in future it's already an EasyDict-like object
-            try:
-                cfg_dict = dict(cfg0)
-            except Exception:
-                cfg_dict = cfg0
+            dreamidv_ckpt = os.path.join(folder_paths.models_dir, 'DreamID-V', 'dreamidv.pth')
+            cfg0 = WAN_CONFIGS_WAN[task]
 
-        # 2) inject UI value
-        if isinstance(cfg_dict, dict):
+        # copy + inject t5_device
+        if isinstance(cfg0, dict):
+            cfg_dict = dict(cfg0)
             cfg_dict["t5_device"] = t5_device
-            # 3) convert dict -> attribute-access object
             cfg = types.SimpleNamespace(**cfg_dict)
         else:
-            # already attribute-access object
-            cfg = cfg_dict
+            cfg = cfg0
             setattr(cfg, "t5_device", t5_device)
-        
-        print(f"[Loader] t5_device UI = {t5_device}")
 
-        wan_swapface = DreamIDV(
-            config=cfg,
-            checkpoint_dir=ckpt_dir,
-            dreamidv_ckpt=dreamidv_ckpt,
-        )
+        print(f"[Loader] backend={backend} main_device={main_device} t5_device={t5_device}")
 
-        return (wan_swapface, )
+        if backend == "wan_faster":
+            # Faster 支持 device_id + t5_cpu (bool)
+            device_id = 0 if str(main_device) == "cuda:0" else 1
+            t5_cpu = (str(t5_device).lower() == "cpu")
 
+            # Optional enhancement: pass t5_device_id so T5 can live on cuda:1
+            # cpu  -> t5_cpu=True,  t5_device_id=None
+            # cuda:X -> t5_cpu=False, t5_device_id=X
+            t5_device_id = None
+            try:
+                if not t5_cpu and str(t5_device).startswith("cuda:"):
+                    t5_device_id = int(str(t5_device).split(":")[1])
+            except Exception:
+                t5_device_id = None
+ 
+            wan_swapface = dreamidv_wan_faster.DreamIDV(
+                config=cfg,
+                checkpoint_dir=ckpt_dir,
+                dreamidv_ckpt=dreamidv_ckpt,
+                device_id=device_id,
+                rank=0,
+                t5_fsdp=False,
+                dit_fsdp=False,
+                use_usp=False,
+                t5_cpu=t5_cpu,
+                t5_device_id=t5_device_id,
+            )
+            setattr(wan_swapface, "_jr_backend", "wan_faster")
+            setattr(wan_swapface, "_jr_main_device", main_device)
+            setattr(wan_swapface, "_jr_t5_device", t5_device)
+        else:
+            wan_swapface = DreamIDV_WAN(
+                config=cfg,
+                checkpoint_dir=ckpt_dir,
+                dreamidv_ckpt=dreamidv_ckpt,
+            )
+            setattr(wan_swapface, "_jr_backend", "wan")
 
+        return (wan_swapface,)
 
 
 class RunningHub_DreamID_V_Sampler:
@@ -617,7 +671,7 @@ class RunningHub_DreamID_V_Sampler:
         pipeline.config.sample_fps = kwargs.get('fps')
         print(pipeline.config)
         sample_steps = kwargs.get('sample_steps')
-        self.pbar = comfy.utils.ProgressBar(sample_steps + 1)
+        #self.pbar = comfy.utils.ProgressBar(sample_steps + 1)
         ref_video_path = kwargs.get('video').get_stream_source()
         ref_image = self.tensor_2_pil(kwargs.get('ref_image'))
         ref_image_path = os.path.join(folder_paths.get_temp_directory(), f'dreamidv_{uuid.uuid4()}.png')
@@ -657,16 +711,28 @@ class RunningHub_DreamID_V_Sampler:
             raise ValueError("Pose and mask video generation failed. no pose detected in the reference video.")
         text_prompt = 'change face'
 
-        ref_paths = [
-            ref_video_path,
-            ref_mask_path,
-            ref_image_path,
-            ref_pose_path
-        ]
+        
+        backend = getattr(pipeline, "_jr_backend", "wan")
 
+        if backend == "wan_faster":
+            # Faster 只吃 (video, mask, ref_image)
+            ref_paths = [ref_video_path, ref_mask_path, ref_image_path]
+
+            # Faster 只支持 unipc（否则 NotImplemented）
+            sample_solver = "unipc"
+
+            # 更贴近 Faster：如果用户没改 steps（你现在默认 20），建议降到 12
+            if sample_steps == 20:
+                sample_steps = 12
+        else:
+            ref_paths = [ref_video_path, ref_mask_path, ref_image_path, ref_pose_path]
+
+        # ✅ create ProgressBar AFTER sample_steps is finalized
+        self.pbar = comfy.utils.ProgressBar(sample_steps + 1)        
         self.update()
 
-        generated = pipeline.generate(
+        generated = _pipeline_generate_compat(
+            pipeline,
             text_prompt,
             ref_paths,
             size=size_tuple,
@@ -676,7 +742,10 @@ class RunningHub_DreamID_V_Sampler:
             sampling_steps=sample_steps,
             guide_scale_img=sample_guide_scale_img,
             seed=seed,
-            update_fn=self.update)
+            update_fn=self.update,      # classic 用得到；faster 会被过滤/或接受（按签名）
+            offload_model=True,         # faster 用得到；classic 会被过滤
+        )        
+
         print(f'generated video shape: {generated.shape}')
         
         # Convert to frames tensor (N, H, W, C) with values in [0, 1]
@@ -887,6 +956,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
 
         # Process chunks
         for ci in range(num_chunks):
+            seed_eff = (seed_base + ci) & 0xFFFFFFFFFFFFFFFF
             start = ci * frame_num
             count = min(frame_num, total_frames - start)
 
@@ -922,26 +992,39 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
             pipeline.config.sample_fps = int(fps)
 
             # progress per chunk
-            self.pbar = comfy.utils.ProgressBar(sample_steps + 1)
+            backend = getattr(pipeline, "_jr_backend", "wan")
 
-            # Fixed seed across chunks to reduce identity/style drift
-            seed = seed_base & 0xFFFFFFFFFFFFFFFF
+            # decide per-chunk effective steps without mutating outer sample_steps
+            steps_eff = sample_steps
+            solver_eff = sample_solver
 
-            ref_paths = [chunk_src, chunk_mask, ref_image_path, chunk_pose]
+            if backend == "wan_faster":
+                ref_paths = [chunk_src, chunk_mask, ref_image_path]
+                solver_eff = "unipc"
+                if steps_eff == 20:
+                    steps_eff = 12
+            else:
+                ref_paths = [chunk_src, chunk_mask, ref_image_path, chunk_pose]
 
-            # Run generation for this chunk
-            generated = pipeline.generate(
+            # ✅ pbar after steps_eff is finalized
+            self.pbar = comfy.utils.ProgressBar(steps_eff + 1)
+
+            generated = _pipeline_generate_compat(
+                pipeline,
                 text_prompt,
                 ref_paths,
                 size=size_tuple,
                 frame_num=cut_count,
                 shift=sample_shift,
-                sample_solver=sample_solver,
-                sampling_steps=sample_steps,
+                sample_solver=solver_eff,
+                sampling_steps=steps_eff,
                 guide_scale_img=sample_guide_scale_img,
-                seed=seed,
-                update_fn=self.update
+                seed=seed_eff,
+                update_fn=self.update,
+                offload_model=True,
             )
+
+
 
             # generated: (C, T, H, W)? existing code assumes (C,T,H,W) and converts to (T,H,W,C)
             frames = (generated.clamp(-1, 1).cpu().permute(1, 2, 3, 0) + 1.0) / 2.0

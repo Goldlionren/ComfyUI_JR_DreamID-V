@@ -64,6 +64,24 @@
 > 💡 **建议新建工作流时使用 JR 节点，旧 workflow 无需修改即可继续使用。**
 
 ---
+## ⚡ DreamID-V Wan-Faster 后端（JR 集成）
+
+本 JR Fork 已集成 **DreamID-V Wan-1.3B-Faster** 推理后端，
+在保持身份一致性的前提下，**显著降低采样步数并提升整体推理速度**。
+
+### Wan-Faster 推荐参数
+
+| 参数名 | 推荐值 | 说明 |
+|------|-------|------|
+| `backend` | `wan_faster` | 需在 Sampler 中手动选择 |
+| `sampling_steps` | **12** | Faster 模型针对短步数训练 |
+| `fps`（长视频） | **16** | 速度 / 质量平衡最佳 |
+| `sample_solver` | `unipc` | **必须使用** |
+| `frame_num` | 81 | 与标准 DreamID-V 一致 |
+| `overlap_frames` | 8–12 | 长视频推荐 |
+
+> ⚠️ 在 `wan_faster` 模式下使用 20+ steps **不会提升质量，只会变慢**。
+---
 
 ## 🎞️ 长视频分块采样（JR 增强）
 
@@ -74,6 +92,9 @@
 
 * **`frame_num`**：**每个 chunk 的帧数（chunk 大小就在这里设置）**。  
   例如：总 1620 帧，`frame_num=81` → 约 20 个 chunk。
+> 💡 **Wan-Faster 建议**：  
+> 使用 `backend=wan_faster` 时，推荐将 `fps` 设置为 **16**，以获得最佳速度与稳定性。
+
 
 * **`fps`**（仅 LongVideo 节点）：
   * `-1`（默认）：跟随源视频 FPS（不做重采样）
@@ -314,6 +335,27 @@ ComfyUI/models/DreamID-V/
 > ⚠️ 显存越大体验越好，但 **JR Fork 不再强制要求 4090 / 5090**。
 
 ---
+## 🚀 Wan-Faster 使用方式（强烈推荐）
+
+1. 添加 `JR_DreamID-V_Loader`
+2. 添加 `JR_DreamID-V_Sampler` 或 `JR_DreamID-V_LongVideo_Sampler`
+3. 在 **Sampler 节点**中：
+   * 设置 **`backend = wan_faster`**
+   * 设置 **`sampling_steps = 12`**
+   * 确保 **`sample_solver = unipc`**
+4. （长视频）设置：
+   * **`fps = 16`**
+5. 运行工作流
+
+### 重要说明
+
+* `wan_faster` 内部 **不使用 pose 参考视频**
+* 实际使用的参考输入为：
+  * 原始视频
+  * 人脸 mask 视频
+  * 单张参考人脸图像
+* 推理进度将通过 **ComfyUI 绿色进度条** 显示
+---
 
 ## 📝 License & Fork 声明
 
@@ -334,7 +376,9 @@ HM-RunningHub / ComfyUI_RH_DreamID-V
 * Wan Team
 * ComfyUI
 * 原 RunningHub 项目作者
-
+>特别感谢 DreamID-V 原作者引入的 **Wan-1.3B-Faster**
+>模型与推理方案，使得在保持身份一致性的同时，
+>能够以更少的采样步数实现显著加速。
 ---
 
 ## ⚠️ 免责声明
