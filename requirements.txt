@@ -8,4 +8,6 @@ decord
 tqdm
 mediapipe
 onnxruntime
+diffusers>=0.30.0
+
 
