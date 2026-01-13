@@ -49,6 +49,9 @@ This fork is designed to:
   Replaces legacy MediaPipe pose extraction with **DWPose (ONNXRuntime)**.  
   Supports **CUDA / TensorRT acceleration**, significantly improving stability and accuracy on complex motion videos.
 
+* 🕺 **Wan_Faster version (JR Fork)**  
+  Replaces legacy MediaPipe pose extraction with **DWPose (ONNXRuntime)**.  
+  introducing DreamID-V-Wan-1.3B-DWPose. This significantly improves stability and robustness in pose extraction.
 ---
 
 ## 📋 Nodes
@@ -134,6 +137,103 @@ It splits the input into chunks, processes each chunk sequentially, writes inter
 This node uses **FFmpeg/FFprobe** for probing, cutting and encoding.  
 Make sure `ffmpeg` and `ffprobe` are available in your system `PATH`.
 
+---
+---
+
+## ⚠️ Important: FlashAttention 2 Requirement (Wan-Faster Backend)
+
+> **This section is critical. Please read before using `wan_faster`.**
+
+### Why FlashAttention 2 is Required
+
+The **`wan_faster` backend** in DreamID-V **relies on FlashAttention 2 (FA2)** for its attention implementation.
+
+* FA2 is **not optional**
+* FA2 is **not automatically installed**
+* Without FA2, `wan_faster` will **crash at runtime**
+
+If FlashAttention 2 is missing or incompatible, you will see errors such as:
+
+```
+AssertionError: FLASH_ATTN_2_AVAILABLE
+```
+
+or
+
+```
+CUDA error: no kernel image is available for execution on the device
+```
+
+---
+
+### Supported GPUs (FlashAttention 2)
+
+FlashAttention 2 requires **Ampere or newer GPUs**.
+
+| GPU             | Compute Capability | FA2 Support     |
+| --------------- | ------------------ | --------------- |
+| RTX 3060        | SM 8.6             | ✅ Supported     |
+| RTX 3080 / 3090 | SM 8.6             | ✅ Supported     |
+| RTX 40xx        | SM 8.9             | ✅ Supported     |
+| RTX 20xx        | SM 7.5             | ❌ Not supported |
+
+Check your GPU capability:
+
+```bash
+python -c "import torch; print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))"
+```
+
+---
+
+### Installing FlashAttention 2 (Windows / Linux)
+
+> ⚠️ **FlashAttention wheels are CUDA & Python version specific**
+
+Recommended environment (tested):
+
+* Python **3.10-12**
+* CUDA **12.x / 13.0**
+* PyTorch CUDA build
+
+Install:
+
+```bash
+pip install flash-attn==2.8.2 --no-build-isolation
+```
+
+Then verify:
+
+```bash
+python - <<EOF
+import torch
+from flash_attn import flash_attn_func
+q = torch.randn(1, 128, 8, 64, device="cuda", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+o = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
+print("FlashAttention OK:", o.shape)
+EOF
+```
+
+If this test passes, **Wan-Faster will work**.
+
+You can also use whl from: 
+https://github.com/Goldlionren/AI-windows-whl.git
+
+---
+
+### Backend Behavior Summary
+
+| Backend      | FlashAttention 2 | Notes                   |
+| ------------ | ---------------- | ----------------------- |
+| `wan`        | ❌ Not required   | Slower, more compatible |
+| `wan_faster` | ✅ **Required**   | Faster, fewer steps     |
+
+If your GPU **does not support FA2**, use:
+
+```
+backend = wan
+```
 ---
 
 ## 🕺 DWPose Pose Backend (JR Enhancement)
@@ -403,6 +503,31 @@ based on the selected backend
   * reference image
 * Progress is reported via ComfyUI’s native green progress bar.
 
+---
+## ⚠️ MediaPipe Dependency (Optional)
+
+MediaPipe is **NOT required** when:
+
+* Using **DWPose**
+* Using **wan_faster**
+* Using Python ≥ 3.12 (MediaPipe incompatible)
+
+JR Fork makes MediaPipe **optional**:
+
+* If MediaPipe is unavailable → **automatically skipped**
+* No impact on DWPose-based workflows
+* No impact on Wan-Faster backend
+
+---
+
+## 🧠 Key Design Decision (JR Fork)
+
+> **Pose extraction, text encoding, and diffusion are fully decoupled**
+
+* T5 can run on **CPU**
+* DWPose runs via **ONNXRuntime (GPU)**
+* Wan-Faster requires **FlashAttention 2**
+* No cross-device interference
 ---
 
 ## 📝 License & Fork Statement

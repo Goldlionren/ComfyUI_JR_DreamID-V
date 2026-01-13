@@ -64,6 +64,7 @@
 > 💡 **建议新建工作流时使用 JR 节点，旧 workflow 无需修改即可继续使用。**
 
 ---
+
 ## ⚡ DreamID-V Wan-Faster 后端（JR 集成）
 
 本 JR Fork 已集成 **DreamID-V Wan-1.3B-Faster** 推理后端，
@@ -124,6 +125,94 @@
 `ffmpeg`、`ffprobe`。
 
 ---
+## ⚠️ 重要说明：Wan-Faster 必须安装 FlashAttention 2
+
+> **如果你使用 `wan_faster` 后端，请务必阅读本节**
+
+### 为什么必须安装 FlashAttention 2？
+
+`wan_faster` 后端在注意力实现中 **强依赖 FlashAttention 2（FA2）**：
+
+* ❌ **不是可选**
+* ❌ **不会自动安装**
+* ❌ 缺失会直接运行崩溃
+
+常见报错包括：
+
+```
+AssertionError: FLASH_ATTN_2_AVAILABLE
+```
+
+或：
+
+```
+CUDA error: no kernel image is available for execution on the device
+```
+
+---
+
+### FlashAttention 2 支持的显卡
+
+FA2 仅支持 **Ampere 及更新架构**：
+
+| 显卡              | 架构     | 是否支持  |
+| --------------- | ------ | ----- |
+| RTX 3060        | SM 8.6 | ✅ 支持  |
+| RTX 3080 / 3090 | SM 8.6 | ✅     |
+| RTX 40 系列       | SM 8.9 | ✅     |
+| RTX 20 系列       | SM 7.5 | ❌ 不支持 |
+
+检测方法：
+
+```bash
+python -c "import torch; print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))"
+```
+
+---
+
+### FlashAttention 2 安装方式（强烈推荐）
+
+推荐环境（已实测）：
+
+* Python **3.10-12**
+* CUDA **12.x / 13.0**
+* PyTorch CUDA 版本
+
+安装命令：
+
+```bash
+pip install flash-attn==2.8.2 --no-build-isolation
+```
+
+安装后验证：
+
+```bash
+python - <<EOF
+import torch
+from flash_attn import flash_attn_func
+q = torch.randn(1, 128, 8, 64, device="cuda", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+o = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
+print("FlashAttention 正常:", o.shape)
+EOF
+```
+
+测试通过即可放心使用 `wan_faster`。
+
+如果上述方法遇到困难,也可以直接使用: https://github.com/Goldlionren/AI-windows-whl.git
+里面的whl,会容易很多.
+---
+
+### 后端选择建议
+
+| 后端           | 是否需要 FA2 | 说明      |
+| ------------ | -------- | ------- |
+| `wan`        | ❌ 不需要    | 兼容性最好   |
+| `wan_faster` | ✅ 必须     | 更快、更省步数 |
+
+---
+
 
 ## 🕺 DWPose 姿态后端（JR 增强功能）
 
@@ -387,6 +476,26 @@ ComfyUI/models/DreamID-V/
   * 人脸 mask 视频
   * 单张参考人脸图像
 * 推理进度将通过 **ComfyUI 绿色进度条** 显示
+
+---
+---
+
+## 📌 MediaPipe 说明（已变为可选）
+
+在 JR Fork 中：
+
+* 只要选择 **DWPose**
+* 或使用 **wan_faster**
+* 或 Python ≥ 3.12
+
+➡ **MediaPipe 将完全不参与运行**
+
+这意味着：
+
+* 可以安全移除 MediaPipe依赖,以及相对应的模型
+* 不影响最终效果
+* 不影响 DWPose / Wan-Faster
+
 ---
 
 ## 📝 License & Fork 声明

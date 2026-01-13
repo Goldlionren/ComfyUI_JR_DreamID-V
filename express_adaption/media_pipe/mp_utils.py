@@ -18,11 +18,11 @@ from tqdm import tqdm
 import multiprocessing
 import glob
 
-import mediapipe as mp
-from mediapipe import solutions
-from mediapipe.framework.formats import landmark_pb2
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+#import mediapipe as mp
+#from mediapipe import solutions
+#from mediapipe.framework.formats import landmark_pb2
+#from mediapipe.tasks import python
+#from mediapipe.tasks.python import vision
 from . import face_landmark
 
 CUR_DIR = os.path.dirname(__file__)
@@ -30,11 +30,31 @@ CUR_DIR = os.path.dirname(__file__)
 
 class LMKExtractor():
     def __init__(self, FPS=25):
+        try:
+            import mediapipe as mp
+            from mediapipe import solutions
+            from mediapipe.framework.formats import landmark_pb2
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except Exception as e:
+            raise RuntimeError(
+                "[DreamID-V] MediaPipe is not installed or incompatible.\n"
+                "Python 3.13 is not supported for MediaPipe backend.\n"
+                "If you are on Python <= 3.12, install: pip install \"mediapipe<0.10.30\".\n"
+                f"Original error: {repr(e)}"
+            ) from e
+
+        self.mp = mp
+        self.vision = vision
+        self.mp_python = mp_python
+
         # Create an FaceLandmarker object.
-        self.mode = mp.tasks.vision.FaceDetectorOptions.running_mode.IMAGE
-        base_options = python.BaseOptions(model_asset_path=os.path.join(CUR_DIR, 'mp_models/face_landmarker_v2_with_blendshapes.task'))
-        base_options.delegate = mp.tasks.BaseOptions.Delegate.CPU
-        options = vision.FaceLandmarkerOptions(base_options=base_options,
+        self.mode = self.vision.RunningMode.IMAGE
+        base_options = self.mp_python.BaseOptions(
+            model_asset_path=os.path.join(CUR_DIR, 'mp_models/face_landmarker_v2_with_blendshapes.task')
+        )
+        base_options.delegate = self.mp.tasks.BaseOptions.Delegate.CPU
+        options = self.vision.FaceLandmarkerOptions(base_options=base_options,
                                             running_mode=self.mode,
                                             output_face_blendshapes=True,
                                             output_facial_transformation_matrixes=True,
@@ -43,32 +63,38 @@ class LMKExtractor():
         self.last_ts = 0
         self.frame_ms = int(1000 / FPS)
 
-        det_base_options = python.BaseOptions(model_asset_path=os.path.join(CUR_DIR, 'mp_models/blaze_face_short_range.tflite'))
-        det_options = vision.FaceDetectorOptions(base_options=det_base_options)
-        self.det_detector = vision.FaceDetector.create_from_options(det_options)
+        det_base_options = self.mp_python.BaseOptions(
+            model_asset_path=os.path.join(CUR_DIR, 'mp_models/blaze_face_short_range.tflite')
+        )
+        det_options = self.vision.FaceDetectorOptions(base_options=det_base_options)
+
+        self.det_detector = self.vision.FaceDetector.create_from_options(det_options)
+
                 
 
     def __call__(self, img):
         frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+        image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=frame)
+
         t0 = time.time()
-        if self.mode == mp.tasks.vision.FaceDetectorOptions.running_mode.VIDEO:
+        if self.mode == self.vision.RunningMode.VIDEO:
+
             det_result = self.det_detector.detect(image)
             if len(det_result.detections) != 1:
                 return None
             self.last_ts += self.frame_ms
             try:
                 detection_result, mesh3d = self.detector.detect_for_video(image, timestamp_ms=self.last_ts)
-            except:
+            except Exception:
                 return None
-        elif self.mode == mp.tasks.vision.FaceDetectorOptions.running_mode.IMAGE:
+        elif self.mode == self.vision.RunningMode.IMAGE:
             # det_result = self.det_detector.detect(image)
 
             # if len(det_result.detections) != 1:
             #     return None
             try:
                 detection_result, mesh3d = self.detector.detect(image)
-            except:
+            except Exception:
                 return None
             
         

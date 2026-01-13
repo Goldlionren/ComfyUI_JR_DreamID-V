@@ -35,13 +35,28 @@ from .dreamidv_wan.utils.utils import cache_video, cache_image, str2bool
 
 import cv2
 import numpy as np
-from .express_adaption.media_pipe import FaceMeshDetector, FaceMeshAlign_dreamidv
 from .pose.extract import process_dwpose
 
-from .express_adaption.get_video_npy import get_video_npy
 import folder_paths
 
 import types
+
+def _lazy_import_mediapipe_backend():
+    """
+    Lazy import MediaPipe backend to avoid breaking ComfyUI startup on Python 3.13.
+    Only call this when MediaPipe backend is actually required.
+    """
+    try:
+        from .express_adaption.media_pipe import FaceMeshDetector, FaceMeshAlign_dreamidv
+        from .express_adaption.get_video_npy import get_video_npy
+        return FaceMeshDetector, FaceMeshAlign_dreamidv, get_video_npy
+    except Exception as e:
+        raise RuntimeError(
+            "[DreamID-V] MediaPipe backend is unavailable.\n"
+            "- If you are on Python 3.13: MediaPipe is not supported, please use DWPose backend.\n"
+            "- If you are on Python <= 3.12: install optional dependency: pip install \"mediapipe<0.10.30\".\n"
+            f"Original error: {repr(e)}"
+        ) from e
 
 
 # ---------------- DWPose ONNX models (ComfyUI/models convention) ----------------
@@ -341,11 +356,20 @@ def generate_pose_and_mask_videos(ref_video_path, ref_image_path, pose_backend='
             if not dwpose_fallback:
                 raise
             print(f"[DreamID-V] DWPose failed, fallback to MediaPipe. Error: {repr(e)}")
+            try:
+                FaceMeshDetector, FaceMeshAlign_dreamidv, get_video_npy = _lazy_import_mediapipe_backend()
+            except Exception as mp_e:
+                raise RuntimeError(
+                    "[DreamID-V] DWPose failed and MediaPipe fallback is unavailable.\n"
+                    "Please disable dwpose_fallback or use Python <= 3.12 with mediapipe installed.\n"
+                    f"DWPose error: {repr(e)}\n"
+                    f"MediaPipe error: {repr(mp_e)}"
+                ) from mp_e
 
-
-
+    FaceMeshDetector, FaceMeshAlign_dreamidv, get_video_npy = _lazy_import_mediapipe_backend()
     detector = FaceMeshDetector()
     get_align_motion = FaceMeshAlign_dreamidv()
+
     CORE_LANDMARK_INDICES = [
         78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 95, 88, 178, 87, 14, 317, 402, 318, 324,
         61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 146, 91, 181, 84, 17, 314, 405, 321, 375,

@@ -29,16 +29,40 @@ from IPython.display import display, Image as IPyImage
 import torchvision.transforms as T
 
 import sys
-from .media_pipe.mp_utils  import LMKExtractor
-from .media_pipe.draw_util import FaceMeshVisualizer
+#from .media_pipe.mp_utils  import LMKExtractor
+#from .media_pipe.draw_util import FaceMeshVisualizer
 from .media_pipe.pose_util import project_points_with_trans, matrix_to_euler_and_translation, euler_and_translation_to_matrix
 
-lmk_extractor = LMKExtractor()
-vis = FaceMeshVisualizer(forehead_edge=False)
+#lmk_extractor = LMKExtractor()
+#vis = FaceMeshVisualizer(forehead_edge=False)
+
+_lmk_extractor = None
+_vis = None
+
+def _get_mp_helpers():
+    global _lmk_extractor, _vis
+    if _lmk_extractor is None or _vis is None:
+        from .media_pipe.mp_utils import LMKExtractor
+        from .media_pipe.draw_util import FaceMeshVisualizer
+        _lmk_extractor = LMKExtractor()
+        _vis = FaceMeshVisualizer(forehead_edge=False)
+    return _lmk_extractor, _vis
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def get_video_npy(video_path):
-
-    
+    lmk_extractor, vis = _get_mp_helpers()
 
     frames = imageio.get_reader(video_path)
 

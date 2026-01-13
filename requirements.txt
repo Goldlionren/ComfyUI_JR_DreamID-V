@@ -6,7 +6,7 @@ Pillow
 opencv-python
 decord
 tqdm
-mediapipe
+mediapipe<0.10.30; python_version < "3.13"
 onnxruntime
 diffusers>=0.30.0
 
