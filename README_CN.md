@@ -41,7 +41,24 @@
   使用 DWPose（ONNXRuntime）替代原有 MediaPipe 姿态提取流程，  
   在复杂动作视频中稳定性与成功率显著提升，支持 CUDA / TensorRT 加速。
 ---
+---
 
+## 中文版 Update（更新说明）
+
+### JR_LoadVideoPlus 节点更新
+
+* 新增 `target_long_edge` 参数：按**最长边像素**缩放并**保持原始宽高比**，无需手动计算目标分辨率。
+* 保留 `VIDEO` 输出类型不变：可直接与现有 `Sampler` 链路对接（无需调整下游节点）。
+* 新增 3 个输出端口，便于下游动态连接与参数联动：
+
+  * `out_w`：最终输出宽度
+  * `out_h`：最终输出高度
+  * `out_fps`：最终输出 FPS
+* `out_fps` 统一输出为整数（`int`，采用 `round` 规则），提升下游节点兼容性与行为一致性。
+
+> 说明：当启用 `target_long_edge` 时，节点将优先生效并自动计算短边；`scale_w/scale_h` 仅在未启用 `target_long_edge` 时作为强制尺寸选项使用。
+
+---
 ## 📋 节点说明
 
 本插件提供两组节点（**完全兼容旧 workflow**）：

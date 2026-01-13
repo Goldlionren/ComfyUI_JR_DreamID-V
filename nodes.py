@@ -1145,6 +1145,190 @@ class JR_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_LongVideo_Sampler):
     CATEGORY = "JR/DreamID-V"
 
 
+# ---- JR LoadVideoPlus: VHS-like pre-processing but keeps VIDEO output ----
+
+class JR_LoadVideoPlus:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": ("VIDEO",),  # 直接吃原版 LoadVideo 的输出
+                "start_time": ("FLOAT", {"default": 0.0, "min": 0.0}),
+                "end_time": ("FLOAT", {"default": -1.0, "min": -1.0}),
+                "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0}),
+                "target_long_edge": ("INT", {"default": 0, "min": 0}),
+                "scale_w": ("INT", {"default": 0, "min": 0}),
+                "scale_h": ("INT", {"default": 0, "min": 0}),
+                "keep_audio": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+
+    RETURN_TYPES = ("VIDEO", "INT", "INT", "INT")
+    RETURN_NAMES = ("video", "out_w", "out_h", "out_fps")
+
+    FUNCTION = "load"
+    CATEGORY = "JR/Video"
+
+    def _resolve_video_path(self, file: str) -> str:
+        p = (file or "").strip().strip('"')
+        if not p:
+            return ""
+
+        # Absolute path: use as-is
+        if os.path.isabs(p):
+            return p
+
+        # Relative path: treat as relative to ComfyUI input directory if available
+        try:
+            base = folder_paths.get_input_directory()
+        except Exception:
+            # Fallback: best-effort - put it under ComfyUI's "input" folder in current working dir
+            base = os.path.join(os.getcwd(), "input")
+
+        return os.path.join(base, p)
+    
+    def _probe_video_size(self, video_path: str):
+        ffprobe = _which_bin("ffprobe")
+        cmd = [
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0",
+            video_path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        w, h = out.split(",")
+        return int(w), int(h)
+
+
+    def _probe_video_fps(self, video_path: str) -> float:
+        ffprobe = _which_bin("ffprobe")
+        cmd = [
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            video_path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        # examples: "30000/1001", "25/1", "30"
+        if not out:
+            return 0.0
+        if "/" in out:
+            a, b = out.split("/", 1)
+            b = float(b)
+            return float(a) / b if b != 0 else 0.0
+        return float(out)
+
+
+    def load(self, video, start_time=0.0, end_time=-1.0, target_fps=0.0,
+             target_long_edge=0, scale_w=0, scale_h=0, keep_audio=True):
+
+        if video is None:
+            raise ValueError("Input VIDEO is None")
+
+        # 关键：从 VIDEO 对象取真实文件路径
+        src = video.get_stream_source()
+        if not src or not os.path.exists(src):
+            raise FileNotFoundError(f"Video source not found: {src}")
+        
+        if VideoFromFile is None:
+            raise RuntimeError("VideoFromFile is unavailable (comfy_api missing). Please update ComfyUI.")
+
+
+        # Decide whether to process or passthrough
+        do_trim = (start_time is not None and float(start_time) > 0.0) or \
+                  (end_time is not None and float(end_time) > 0.0)
+        do_fps = (target_fps is not None and float(target_fps) > 0.0)
+
+
+#        do_scale = (int(scale_w) > 0 and int(scale_h) > 0)
+        orig_w, orig_h = self._probe_video_size(src)
+        orig_fps = self._probe_video_fps(src)
+
+        # 默认最终输出 = 原始（除非 target_fps / scale 生效）
+        # Normalize final fps to INT (round for safety)
+        if target_fps is not None and float(target_fps) > 0.0:
+            final_fps = int(round(float(target_fps)))
+        else:
+            final_fps = int(round(float(orig_fps)))
+
+
+        # 先默认 final_w/final_h = 原始，后面如果 long_edge / scale_w/h 生效再覆盖
+        final_w = int(orig_w)
+        final_h = int(orig_h)
+
+
+        if target_long_edge and target_long_edge > 0:
+            tle = int(target_long_edge)
+            if orig_w >= orig_h:
+                final_w = tle
+                final_h = int(round(tle * orig_h / orig_w))
+            else:
+                final_h = tle
+                final_w = int(round(tle * orig_w / orig_h))
+
+        elif scale_w > 0 and scale_h > 0:
+            final_w = int(scale_w)
+            final_h = int(scale_h)
+
+        # force even dimensions for yuv420p compatibility
+        final_w = int(final_w) // 2 * 2
+        final_h = int(final_h) // 2 * 2
+
+        do_scale = (final_w != int(orig_w)) or (final_h != int(orig_h))
+
+
+        # If no enhancement is enabled and audio kept, return original VIDEO as-is.
+        if not (do_trim or do_fps or do_scale) and bool(keep_audio) is True:
+            return (video, int(final_w), int(final_h), int(final_fps))
+        
+        ffmpeg = _which_bin("ffmpeg")
+        temp_dir = os.path.join(folder_paths.get_temp_directory(), "jr_loadvideo_plus")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        out_path = os.path.join(
+            temp_dir,
+            f"lvplus_{uuid.uuid4().hex[:10]}_{os.path.basename(src)}"
+        )
+
+        cmd = [ffmpeg, "-v", "error", "-y"]
+
+        # Fast seek
+        if do_trim and start_time is not None and float(start_time) > 0.0:
+            cmd += ["-ss", str(float(start_time))]
+
+        cmd += ["-i", src]
+
+        # End time: treat as output timeline endpoint
+        if do_trim and end_time is not None and float(end_time) > 0.0:
+            cmd += ["-to", str(float(end_time))]
+
+        vf = []
+        if do_fps:
+            vf.append(f"fps={int(target_fps)}")
+        if do_scale:
+            vf.append(f"scale={final_w}:{final_h}:flags=lanczos")
+        if vf:
+            cmd += ["-vf", ",".join(vf)]
+
+        if not keep_audio:
+            cmd += ["-an"]
+
+        # Encode: fast + compatible
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
+        if keep_audio:
+            cmd += ["-c:a", "aac"]
+
+        cmd += [out_path]
+
+        _run_cmd(cmd, timeout=600)
+
+        # Return VIDEO-compatible object for downstream sampler
+        return (VideoFromFile(out_path), int(final_w), int(final_h), int(final_fps))
+
+
 
 
 
@@ -1156,7 +1340,8 @@ NODE_CLASS_MAPPINGS = {
     # JR keys: new workflows should use these
     "JR_DreamID-V_Loader": JR_DreamID_V_Loader,
     "JR_DreamID-V_Sampler": JR_DreamID_V_Sampler,
-    "JR_DreamID-V_LongVideo_Sampler": JR_DreamID_V_LongVideo_Sampler,    
+    "JR_DreamID-V_LongVideo_Sampler": JR_DreamID_V_LongVideo_Sampler,
+    "JR_LoadVideoPlus": JR_LoadVideoPlus,    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1165,4 +1350,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "JR_DreamID-V_Loader": "JR DreamID-V Loader",
     "JR_DreamID-V_Sampler": "JR DreamID-V Sampler",
     "JR_DreamID-V_LongVideo_Sampler": "JR DreamID-V Long Video Sampler (Chunked)",
+    "JR_LoadVideoPlus": "JR Load Video Plus (VIDEO output)",
 }

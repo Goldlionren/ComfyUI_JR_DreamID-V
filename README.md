@@ -53,7 +53,24 @@ This fork is designed to:
   Replaces legacy MediaPipe pose extraction with **DWPose (ONNXRuntime)**.  
   introducing DreamID-V-Wan-1.3B-DWPose. This significantly improves stability and robustness in pose extraction.
 ---
+---
 
+## English Update (Release Notes)
+
+### JR_LoadVideoPlus Node Updates
+
+* Added `target_long_edge`: scales by the **longer edge (in pixels)** while **preserving the original aspect ratio**, eliminating manual width/height calculations.
+* Kept `VIDEO` output unchanged: remains drop-in compatible with the existing sampler pipeline (no downstream changes required).
+* Added 3 extra output ports for easier downstream wiring and dynamic parameter linkage:
+
+  * `out_w`: final output width
+  * `out_h`: final output height
+  * `out_fps`: final output FPS
+* Normalized `out_fps` to an integer (`int`, using `round`) for improved consistency and downstream compatibility.
+
+> Note: When `target_long_edge` is set (>0), it takes priority and the shorter edge is computed automatically. `scale_w/scale_h` only applies when `target_long_edge` is disabled.
+
+---
 ## 📋 Nodes
 
 This plugin provides **two sets of nodes**, with **full backward compatibility**.
