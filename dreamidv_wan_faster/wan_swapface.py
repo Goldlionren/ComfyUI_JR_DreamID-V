@@ -143,9 +143,12 @@ class DreamIDV:
                              eps=config.eps)
     
         logging.info(f"loading ckpt.")
-        state = torch.load(dreamidv_ckpt, map_location=self.device)
+        state = torch.load(dreamidv_ckpt, map_location="cpu")  # 先落到 CPU
         logging.info(f"loading state dict.")
         missing_keys, unexpected_keys = self.model.load_state_dict(state, strict=False)
+        # 立刻释放 checkpoint state，避免占用内存/显存峰值叠加
+        del state
+        gc.collect()
         logging.info(f"len missing_keys: {len(missing_keys)}")
         logging.info(f"len unexpected_keys: {len(unexpected_keys)}")
         print(missing_keys)
@@ -404,15 +407,21 @@ class DreamIDV:
         context_path = os.path.join(_THIS_DIR, "context.pth")
         context = torch.load(context_path, map_location="cpu")
         context = [t.to(self.device) for t in context]
+        #context = [t.to(self.device, non_blocking=True) for t in context_cpu]
+        #del context_cpu
+        #gc.collect()
         
         y_i_v = latents_ref_video 
         img_ref = latents_ref_image
 
+        y_cat = torch.concat([y_i_v, msk])        # 只创建一次
+        img_zero = torch.zeros_like(img_ref)      # 只创建一次，后续复用
+
+
         arg_tiv = {
             'context': context, 
             'seq_len': seq_len,
-            'y': [torch.concat([y_i_v, msk])],
-  
+            'y': [y_cat],
             'img_ref': [img_ref]
             }
 
@@ -420,8 +429,8 @@ class DreamIDV:
         arg_tv = {
             'context': context,
             'seq_len': seq_len, 
-            'y': [torch.concat([y_i_v, msk])],
-            'img_ref': [torch.zeros_like(img_ref)]
+            'y': [y_cat],
+            'img_ref': [img_zero]
             }
 
 
@@ -459,6 +468,7 @@ class DreamIDV:
             # sample videos
             latents = noise
 
+            self.model.to(self.device)
             for i, t in enumerate(tqdm(timesteps)):
                 if update_fn is not None:
                     # ComfyUI ProgressBar callback: accept either update_fn() or update_fn(step)
@@ -470,7 +480,7 @@ class DreamIDV:
                 timestep = [t]
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
+                #self.model.to(self.device)
                 pos_tiv = self.model(latents, t=timestep, **arg_tiv)[0]
                 pos_tv = self.model(latents, t=timestep, **arg_tv)[0]
                 
