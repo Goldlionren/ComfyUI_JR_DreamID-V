@@ -861,8 +861,8 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
         })
         return base
 
-    RETURN_TYPES = ('IMAGE', 'VIDEO', 'STRING')
-    RETURN_NAMES = ('frames', 'video', 'frames_dir')
+    RETURN_TYPES = ('IMAGE', 'VIDEO', 'STRING', 'FLOAT')
+    RETURN_NAMES = ('frames', 'video', 'frames_dir', 'fps')
     FUNCTION = "sample_long"
     CATEGORY = "JR/DreamID-V"
     OUTPUT_NODE = True
@@ -1129,7 +1129,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
             except Exception:
                 pass
 
-        return (frames_tensor_out, video_obj, out_frames_dir)
+        return (frames_tensor_out, video_obj, out_frames_dir, float(fps_ui))
 
 
 
