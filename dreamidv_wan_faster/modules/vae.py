@@ -622,13 +622,9 @@ class WanVAE:
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
                  dtype=torch.float,
-                 encode_chunk_size: int = 4,
-                 encode_auto_chunk: bool = True,
                  device="cuda"):
         self.dtype = dtype
         self.device = device
-        self.encode_chunk_size = int(encode_chunk_size) if encode_chunk_size else 4
-        self.encode_auto_chunk = bool(encode_auto_chunk)
 
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -648,74 +644,15 @@ class WanVAE:
             z_dim=z_dim,
         ).eval().requires_grad_(False).to(device)
 
-    def _encode_one_video(self, u, device, chunk_size: int):
-        """
-        Encode a single video tensor u with shape [C, T, H, W] using time-chunking.
-        This reduces peak VRAM usage compared to encoding the full T in one forward.
-        """
-        # u: [C, T, H, W]
-        T = int(u.shape[1])
-        chunk = max(1, int(chunk_size))
-        parts = []
-        for t in range(0, T, chunk):
-            u_chunk = u[:, t:t + chunk].unsqueeze(0).to(device)
-            v = self.model.encode(u_chunk, self.scale).float().squeeze(0)
-            parts.append(v)
-        if len(parts) == 1:
-            return parts[0]
-        # Expected v shape: [Z, T, H, W] (batch squeezed). Concatenate along time dimension.
-        return torch.cat(parts, dim=1)
-
-    def encode(self, videos, device):
+    def encode(self, videos,device):
         """
         videos: A list of videos each with shape [C, T, H, W].
-        device: Target device for encoding (e.g. "cuda").
-
-        Notes:
-        - Uses time-chunking to lower peak VRAM.
-        - If encode_auto_chunk=True, will automatically fall back to smaller chunks on CUDA OOM.
         """
-        outputs = []
-        base_chunk = int(getattr(self, "encode_chunk_size", 4) or 4)
-        auto = bool(getattr(self, "encode_auto_chunk", True))
-
-        for u in videos:
-            # Build candidate chunk sizes for OOM fallbacks: e.g. 4 -> 2 -> 1
-            if auto:
-                candidates = []
-                c = max(1, base_chunk)
-                while True:
-                    candidates.append(c)
-                    if c <= 1:
-                        break
-                    c = max(1, c // 2)
-            else:
-                candidates = [max(1, base_chunk)]
-
-            last_oom = None
-            for c in candidates:
-                try:
-                    with amp.autocast(dtype=self.dtype):
-                        out = self._encode_one_video(u, device, c)
-                    last_oom = None
-                    break
-                except RuntimeError as e:
-                    # Best-effort CUDA OOM fallback
-                    if "out of memory" in str(e).lower():
-                        last_oom = e
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                        continue
-                    raise
-
-            if last_oom is not None:
-                raise last_oom
-
-            outputs.append(out)
-
-        return outputs
+        with amp.autocast(dtype=self.dtype):
+            return [
+                self.model.encode(u.unsqueeze(0).to(device), self.scale).float().squeeze(0)
+                for u in videos
+            ]
 
     def decode(self, zs):
         with amp.autocast(dtype=self.dtype):
