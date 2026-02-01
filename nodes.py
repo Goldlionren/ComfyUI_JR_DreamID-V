@@ -12,6 +12,7 @@ import subprocess
 import math
 import glob
 import gc
+import time
 
 import urllib.request
 import shutil
@@ -855,6 +856,9 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
             # overlap (warm-up) frames: chunk i>0 will prepend these frames from previous chunk,
             # but we will DROP them from output to avoid duplicate frames.
             "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 256}),
+            "enable_warmup": ("BOOLEAN", {"default": True}),
+            "warmup_seconds": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1}),
+            "warmup_steps": ("INT", {"default": 4, "min": 1, "max": 50}),
         })
         base["optional"].update({
             "temp_subdir": ("STRING", {"default": "dreamidv_long"}),
@@ -889,6 +893,92 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
             start_index += 1
         return start_index
 
+
+    def _warmup_pass(
+        self,
+        pipeline,
+        backend: str,
+        ref_video_path: str,
+        ref_mask_path: str,
+        ref_pose_path: str | None,
+        ref_image_path: str,
+        size_tuple: tuple[int, int],
+        fps: float,
+        frame_num: int,
+        sample_steps: int,
+        sample_shift: float,
+        sample_solver: str,
+        sample_guide_scale_img: float,
+        seed_base: int,
+        chunks_dir: str,
+        warmup_seconds: float,
+        warmup_steps: int,
+    ) -> None:
+        # compute warmup frames
+        n = int(round(float(fps) * float(max(0.0, warmup_seconds))))
+        n = max(1, n)
+        n = min(int(frame_num), n)
+
+        w_video = os.path.join(chunks_dir, f"warmup_video_{uuid.uuid4().hex[:6]}.mp4")
+        w_mask  = os.path.join(chunks_dir, f"warmup_mask_{uuid.uuid4().hex[:6]}.mp4")
+        w_pose  = os.path.join(chunks_dir, f"warmup_pose_{uuid.uuid4().hex[:6]}.mp4") if ref_pose_path else None
+
+        # Cut first n frames (frame-accurate)
+        _cut_video_by_frame_range(ref_video_path, w_video, start_frame=0, frame_count=n)
+        _cut_video_by_frame_range(ref_mask_path,  w_mask,  start_frame=0, frame_count=n)
+        if ref_pose_path and w_pose:
+            _cut_video_by_frame_range(ref_pose_path, w_pose, start_frame=0, frame_count=n)
+
+        # Build ref_paths by backend contract
+        if backend == "wan_faster":
+            ref_paths = [w_video, w_mask, ref_image_path]
+            # faster only supports unipc
+            sample_solver = "unipc"
+        else:
+            ref_paths = [w_video, w_mask, ref_image_path, w_pose]
+
+        # Keep warmup short: steps=min(warmup_steps, sample_steps)
+        steps = int(min(int(max(1, warmup_steps)), int(sample_steps)))
+
+        print(f"[DreamID-V][Warmup] frames={n} steps={steps} backend={backend} (no output will be saved)")
+
+        # Use a derived seed to avoid any accidental coupling (output discarded anyway)
+        warm_seed = int(seed_base) ^ 0x9E3779B97F4A7C15
+
+        try:
+            _ = _pipeline_generate_compat(
+                pipeline,
+                "warmup",
+                ref_paths,
+                size=size_tuple,
+                frame_num=n,
+                shift=sample_shift,
+                sample_solver=sample_solver,
+                sampling_steps=steps,
+                guide_scale_img=sample_guide_scale_img,
+                seed=warm_seed,
+                # update_fn/offload_model will be filtered by _pipeline_generate_compat signature anyway
+                update_fn=None,
+                offload_model=True,
+            )
+        finally:
+            # Explicitly drop any tensor refs and clear cache
+            try:
+                del _
+            except Exception:
+                pass
+            # Warmup goal is to KEEP allocator/kernel caches "warm".
+            # Do NOT call empty_cache / mm.soft_empty_cache here.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+
     def sample_long(self, **kwargs):
         # reuse the same params & defaults as sample()
         pipeline = kwargs.get('pipeline')
@@ -898,6 +988,10 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
         frame_num = kwargs.get('frame_num')  # chunk size
         seed_base = kwargs.get('seed') ^ (2 ** 32)
         overlap_frames = int(kwargs.get("overlap_frames", 8) or 0)
+
+        enable_warmup = bool(kwargs.get("enable_warmup", True))
+        warmup_seconds = float(kwargs.get("warmup_seconds", 1.0) or 0.0)
+        warmup_steps = int(kwargs.get("warmup_steps", 4) or 4)
 
         return_frames_as_images = kwargs.get("return_frames_as_images", False)
         max_frames_to_return = int(kwargs.get("max_frames_to_return", 300))
@@ -968,8 +1062,42 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
         except Exception:
             raise ValueError("Pose and mask video generation failed. no pose detected in the reference video.")
 
+        backend = getattr(pipeline, "_jr_backend", "wan")
+
         # Setup temp job dirs
         job_dir, chunks_dir, out_frames_dir = self._job_dirs(temp_subdir)
+
+        # ---- warmup pass (no output) ----
+        if enable_warmup and warmup_seconds > 0.0:
+            # Prepare temp dirs early (you already have _job_dirs(); use chunks_dir for warmup cuts)
+            #job_dir, chunks_dir, out_frames_dir = self._job_dirs(temp_subdir=temp_subdir)
+            # NOTE: if your existing code already created these dirs earlier, reuse them and remove this extra creation.
+
+            # Use same "hardcode" params as your sampler uses (keep consistent)
+            sample_shift = 5.0
+            sample_solver = "unipc"
+            sample_guide_scale_img = 4.0
+
+            self._warmup_pass(
+                pipeline=pipeline,
+                backend=backend,
+                ref_video_path=ref_video_path,
+                ref_mask_path=ref_mask_path,
+                ref_pose_path=ref_pose_path if backend != "wan_faster" else None,
+                ref_image_path=ref_image_path,
+                size_tuple=size_tuple,
+                fps=fps,
+                frame_num=frame_num,
+                sample_steps=sample_steps,
+                sample_shift=sample_shift,
+                sample_solver=sample_solver,
+                sample_guide_scale_img=sample_guide_scale_img,
+                seed_base=seed_base,
+                chunks_dir=chunks_dir,
+                warmup_seconds=warmup_seconds,
+                warmup_steps=warmup_steps,
+            )
+
 
         text_prompt = 'change face'
         sample_shift = 5.0
@@ -1009,8 +1137,10 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
 
             # Cut source/pose/mask by frame range (frame-accurate)
             _cut_video_by_frame_range(ref_video_path, chunk_src, cut_start, cut_count)
-            _cut_video_by_frame_range(ref_pose_path, chunk_pose, cut_start, cut_count)
+            #_cut_video_by_frame_range(ref_pose_path, chunk_pose, cut_start, cut_count)
             _cut_video_by_frame_range(ref_mask_path, chunk_mask, cut_start, cut_count)
+            if backend != "wan_faster":
+                _cut_video_by_frame_range(ref_pose_path, chunk_pose, cut_start, cut_count)
 
             # Update pipeline fps per UI
             pipeline.config.sample_fps = int(fps)
@@ -1069,7 +1199,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
                 del frames_to_save
             except Exception:
                 pass
-            _soft_empty_cache()
+            #_soft_empty_cache()
 
             # Remove per-chunk temp to save disk
             if not keep_temp:
@@ -1077,7 +1207,10 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
                     shutil.rmtree(chunk_dir, ignore_errors=True)
                 except Exception:
                     pass
+            
+            # ✅ Only ONE cache cleanup between chunks (segment boundary)
             _soft_empty_cache()
+
 
         # Encode final video from PNG frames
         output_dir = folder_paths.get_output_directory()

@@ -27,6 +27,7 @@ import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
 import torchvision.transforms.functional as TF
+from typing import List, Optional
 
 from .distributed.fsdp import shard_model
 from .modules.model import WanModel
@@ -222,6 +223,93 @@ class DreamIDV:
         else:
             self.model.to(self.device)
 
+    def _encode_video_latent_chunked(
+        self,
+        video_cthw: torch.Tensor,
+        device: torch.device,
+        *,
+        init_t_chunk: int = 16,
+        min_t_chunk: int = 1,
+        return_cpu: bool = True,
+        tag: str = "ref",
+    ) -> torch.Tensor:
+        """
+        Encode a single video tensor [C,T,H,W] with micro-batching on T to reduce peak VRAM.
+ 
+        - Splits along T into chunks of size t_chunk.
+        - On CUDA OOM, automatically reduces t_chunk and retries.
+        - Optionally returns latents on CPU to minimize VRAM residency.
+ 
+        Returns: latent tensor with time-dimension concatenated.
+        """
+        assert video_cthw.dim() == 4, f"expected [C,T,H,W], got {tuple(video_cthw.shape)}"
+        C, T, H, W = video_cthw.shape
+
+        # Early exit: empty
+        if T <= 0:
+            raise ValueError("video has zero frames (T==0)")
+ 
+        # Choose starting chunk size
+        t_chunk = max(min(init_t_chunk, T), min_t_chunk)
+ 
+        def _empty_cuda_cache():
+            if torch.cuda.is_available() and str(device).startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                   pass
+ 
+        while True:
+            lat_parts: List[torch.Tensor] = []
+            try:
+                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
+                    for s in range(0, T, t_chunk):
+                        e = min(T, s + t_chunk)
+                        # slice [C, t, H, W]
+                        chunk = video_cthw[:, s:e, :, :]
+                        chunk_gpu = chunk.to(device=device, dtype=self.param_dtype, non_blocking=True)
+ 
+                        # VAE expects list of [C,T,H,W]
+                        z = self.vae.encode([chunk_gpu], device, return_cpu=return_cpu)[0]
+                        # z is [Cz, t', h', w'] (Cz is z_dim)
+                        lat_parts.append(z)
+ 
+                        # release per-chunk GPU tensor ASAP
+                        del chunk_gpu
+                        _empty_cuda_cache()
+ 
+                # concat along time dim=1 for [Cz, T', h', w']
+                out = torch.cat(lat_parts, dim=1) if len(lat_parts) > 1 else lat_parts[0]
+                return out
+ 
+            except torch.OutOfMemoryError as oom:
+                # cleanup
+                for p in lat_parts:
+                    try:
+                        del p
+                    except Exception:
+                        pass
+                lat_parts.clear()
+                _empty_cuda_cache()
+ 
+                if t_chunk <= min_t_chunk:
+                    logging.error(f"[VAE-Encode-{tag}] OOM even at t_chunk={t_chunk}. Raising.")
+                    raise
+ 
+                # reduce and retry
+                new_t = max(min_t_chunk, t_chunk // 2)
+                logging.warning(f"[VAE-Encode-{tag}] OOM at t_chunk={t_chunk}, retry with t_chunk={new_t}")
+                t_chunk = new_t
+                continue
+ 
+            finally:
+                # best-effort gc
+                try:
+                    gc.collect()
+                except Exception:
+                     pass
+                _empty_cuda_cache()
+
 
     def load_image_latent_ref_ip_video(self,paths: str, size, device, frame_num):
         # Load size.
@@ -282,11 +370,20 @@ class DreamIDV:
                 )
                 
                 video_frames = video_transform(frames)
-                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
-                    video_vae_latent = self.vae.encode([video_frames.to(device=device, dtype=self.param_dtype)], device)[0]
+ 
+                # Encode video with micro-batching to reduce VRAM peak (avoid cold-start OOM)
+                video_vae_latent = self._encode_video_latent_chunked(
+                    video_frames,
+                    device=device,
+                    init_t_chunk=16,
+                    min_t_chunk=1,
+                    return_cpu=True,
+                    tag="video",
+                )
             
                 ref_vae_latents["video"].append(video_vae_latent)
-
+                # release CPU-side frame tensor as well
+                del video_frames
                 
 
             elif is_image_or_video_by_extension(path) == "video" and i == 1:
@@ -317,10 +414,16 @@ class DreamIDV:
                 )
                 
                 video_frames = video_mask_transform(frames) 
-                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
-                    video_vae_latent = self.vae.encode([video_frames.to(device=device, dtype=self.param_dtype)], device)[0]
-                video_vae_latent = video_vae_latent 
+                video_vae_latent = self._encode_video_latent_chunked(
+                    video_frames,
+                    device=device,
+                    init_t_chunk=16,
+                    min_t_chunk=1,
+                    return_cpu=True,
+                    tag="mask",
+                )
                 ref_vae_latents["mask"].append(video_vae_latent)
+                del video_frames
 
            
 
@@ -357,8 +460,15 @@ class DreamIDV:
                     ]
                 )
                 new_img = image_transform([new_img])
-                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
-                    img_vae_latent = self.vae.encode([new_img.to(device=device, dtype=self.param_dtype)], device)[0]
+                # Image path: still use the same chunked encoder for consistency (T==1)
+                img_vae_latent = self._encode_video_latent_chunked(
+                    new_img,
+                    device=device,
+                    init_t_chunk=1,
+                    min_t_chunk=1,
+                    return_cpu=True,
+                    tag="image",
+                )
                 ref_vae_latents["image"].append(img_vae_latent)
             else:
                 print("Unknown file type.")
@@ -366,7 +476,9 @@ class DreamIDV:
         ref_vae_latents["image"] = torch.cat(ref_vae_latents["image"], dim=0)
         ref_vae_latents["video"] = torch.cat(ref_vae_latents["video"], dim=0)
         ref_vae_latents["mask"] = torch.cat(ref_vae_latents["mask"], dim=0)
-        
+
+        # Keep latents on CPU here; caller can move to GPU as needed.
+        # This avoids keeping large ref latents resident on VRAM during preprocessing.        
         
         return ref_vae_latents
 
@@ -430,12 +542,10 @@ class DreamIDV:
                                                           frame_num,
                                                         )
 
-        latents_ref_video = latents_ref["video"].to(device,dtype)
-
-        latents_ref_image = latents_ref["image"].to(device,dtype)
-        
-        
-        msk = latents_ref["mask"].to(device,dtype)
+        # Move ref latents to GPU only when needed (they are produced on CPU to reduce VRAM peak)
+        latents_ref_video = latents_ref["video"].to(device=device, dtype=dtype, non_blocking=True)
+        latents_ref_image = latents_ref["image"].to(device=device, dtype=dtype, non_blocking=True)
+        msk = latents_ref["mask"].to(device=device, dtype=dtype, non_blocking=True)
 
         F = frame_num
         target_shape = (self.vae.model.z_dim, latents_ref_video.shape[1],

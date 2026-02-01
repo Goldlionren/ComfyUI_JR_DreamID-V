@@ -6,6 +6,7 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from typing import List
 
 __all__ = [
     'WanVAE',
@@ -644,15 +645,21 @@ class WanVAE:
             z_dim=z_dim,
         ).eval().requires_grad_(False).to(device)
 
-    def encode(self, videos,device):
+    def encode(self, videos, device, return_cpu: bool = False):
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
+        outs: List[torch.Tensor] = []
         with amp.autocast(dtype=self.dtype):
-            return [
-                self.model.encode(u.unsqueeze(0).to(device), self.scale).float().squeeze(0)
-                for u in videos
-            ]
+            for u in videos:
+                # u: [C,T,H,W]
+                z = self.model.encode(u.unsqueeze(0).to(device), self.scale).float().squeeze(0)
+                if return_cpu:
+                    z = z.to("cpu", non_blocking=True)
+                outs.append(z)
+                # best-effort release
+                del z
+        return outs
 
     def decode(self, zs):
         with amp.autocast(dtype=self.dtype):
