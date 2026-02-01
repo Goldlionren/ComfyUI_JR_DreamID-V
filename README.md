@@ -25,6 +25,7 @@ This fork is designed to:
 * ✅ Support **CPU / GPU mixed offloading**
 * ✅ Reduce OOM issues on mid-range hardware
 * ✅ Preserve full compatibility with existing RunningHub workflows
+* ✅  Can run 720x1280 FPS16 5s face swap on RTX5060Ti 16G 
 
 ---
 
@@ -155,6 +156,196 @@ This node uses **FFmpeg/FFprobe** for probing, cutting and encoding.
 Make sure `ffmpeg` and `ffprobe` are available in your system `PATH`.
 
 ---
+## 🧠 Memory & Performance Optimizations (JR Fork Core)
+# 🧠 Memory & Performance Optimizations (JR Fork Core)
+
+> **This section explains *why* the JR fork can run higher resolution / longer videos on mid-range GPUs.**
+> Full technical details and implementation notes are available in:
+>
+> 📄 **`/docs/DreamID-V Memory & Performance Optimizations_01022026.md`**
+
+Unlike the original DreamID-V implementation—which primarily targets high-end GPUs (RTX 4090 / 5090)—the **JR fork introduces a series of architecture-aware, inference-time optimizations** that significantly reduce peak VRAM usage **without sacrificing output quality**.
+
+These optimizations are **not simple parameter tweaks**, but targeted improvements based on how **DiT / Transformer-based diffusion models** behave at scale.
+
+---
+
+## 🔑 Key Optimizations Overview
+
+### 1️⃣ FFN Chunking (Most Critical)
+
+DreamID-V uses a **Diffusion Transformer (DiT)** backbone.
+In DiT models, the **Feed-Forward Network (FFN)** inside each Transformer block is the **largest source of peak VRAM usage**.
+
+The JR fork introduces **FFN Chunking**:
+
+* Splits the token dimension **N** into smaller chunks
+* Computes FFN activations **chunk-by-chunk**
+* Reassembles the output without numerical approximation
+
+✔ **Exact same output**
+✔ **Significantly lower peak VRAM**
+✔ **No quality loss**
+
+Typical runtime log:
+
+```
+[FFN-Chunk] patched 30 FFN blocks with auto-chunking
+[FFN-Chunk] auto select chunks=8 for N=10800
+```
+
+---
+
+### 2️⃣ Token Count Awareness (What is `N`?)
+
+In DreamID-V (DiT-based), memory usage scales with the **number of tokens (`N`)**, not just resolution.
+
+Simplified:
+
+```
+N ≈ T × (H / stride) × (W / stride)
+```
+
+Where:
+
+* `T` = number of frames processed in a chunk
+* `H, W` = spatial resolution
+* `stride` = model patch / VAE stride (typically 8 or 16)
+
+As resolution and frame count increase, **N grows rapidly**, directly impacting FFN and Attention memory usage.
+
+The JR fork dynamically **selects FFN chunk counts based on N**, instead of using a fixed configuration.
+
+---
+
+### 3️⃣ Recommended FFN Chunk Heuristics
+
+Based on extensive testing, the following **practical rule-of-thumb** is used:
+
+```text
+recommended_chunks ≈ ceil(N / 4000)
+clamped to range [2, 16]
+```
+
+### Typical Examples
+
+| Resolution | Frames per chunk | Typical N | Recommended FFN Chunks |
+| ---------- | ---------------- | --------- | ---------------------- |
+| 512p       | 16               | ~6k       | 2–4                    |
+| 720p       | 16               | ~9k       | 4–6                    |
+| 1024p      | 16               | ~11–14k   | 6–8                    |
+| 1280p      | 16               | ~18–22k   | 8–12                   |
+| 1280p      | 41               | ~25–28k   | 8–16                   |
+
+> 💡 **Practical Sweet Spot**
+> For most 1024p–1280p workloads, **`FFN chunks = 8`** offers the best stability/performance balance.
+
+---
+
+### 4️⃣ VAE Temporal Micro-Batching (Encode & Decode)
+
+#### Problem
+
+The original implementation encodes and decodes **entire video sequences at once**, which often causes:
+
+* Sudden VRAM spikes
+* CUDA allocator fragmentation
+* OOM in `conv` / `F.pad` layers
+
+#### JR Fork Solution
+
+* **Temporal chunking** along the time dimension for VAE **encode**
+* Automatic fallback to smaller temporal chunks on OOM
+* **Optimized decode path** that avoids incremental `torch.cat` (a common VRAM trap)
+
+Result:
+
+✔ Lower peak VRAM
+✔ Much higher stability on long videos
+✔ Identical decoded output
+
+---
+
+### 5️⃣ Warmup Pass (Formalized)
+
+A long-standing community trick:
+
+> *“Run 1 second first, then run the full video.”*
+
+The JR fork **formalizes this into an explicit warmup pass**:
+
+* Same resolution and backend as the real run
+* Very short duration (e.g. 1 second)
+* Very few steps (e.g. 4)
+* **No output is saved**
+* **No `empty_cache()` is called**
+
+Purpose:
+
+* Initialize CUDA context
+* Warm up kernels / autotune paths
+* Stabilize the memory allocator
+
+This dramatically improves **first-chunk stability** and reduces unexplained early OOMs.
+
+---
+
+### 6️⃣ Cache Management (Critical Rule)
+
+The JR fork follows a strict cache policy:
+
+| Location                 | Clear Cache?       |
+| ------------------------ | ------------------ |
+| Inside FFN / Attention   | ❌                  |
+| During sampling steps    | ❌                  |
+| During VAE encode/decode | ❌                  |
+| **Between video chunks** | ✅ (once per chunk) |
+
+This preserves allocator “warm state” while preventing long-term memory accumulation.
+
+---
+
+## 📈 Real-World Results
+
+**5-second video, 720×1280 resolution, 16 FPS (Wan-Faster):**
+
+| Metric         | Before JR Optimizations | After JR Optimizations |
+| -------------- | ----------------------- | ---------------------- |
+| Cold start     | OOM                     | Stable                 |
+| Peak VRAM      | ~17–18 GB               | ~15–16 GB              |
+| Inference VRAM | ~99%                    | ~8–10 GB               |
+| Runtime        | 20+ min / unstable      | ~18 min stable         |
+| Output quality | –                       | Identical              |
+
+---
+
+## 📄 Further Reading
+
+> For a **deep dive into implementation details**, including:
+>
+> * FFN chunk patching
+> * Token dimension analysis
+> * VAE stride behavior
+> * Decode memory pitfalls
+> * Warmup design rationale
+>
+> 👉 **See:**
+> 📘 **`/docs/DreamID-V Memory & Performance Optimizations_01022026.md`**
+
+---
+
+## 🧩 Why This Matters
+
+These optimizations transform DreamID-V from:
+
+> ❌ *“Only usable on flagship GPUs”*
+
+into:
+
+> ✅ **“Predictable, tunable, and stable on 16GB-class hardware”**
+
+— without modifying the trained model or sacrificing visual fidelity.
+
 ---
 
 ## ⚠️ Important: FlashAttention 2 Requirement (Wan-Faster Backend)
