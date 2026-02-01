@@ -552,19 +552,23 @@ class WanVAE_(nn.Module):
             z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
+        outs = []
         for i in range(iter_):
             self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+            out_i = self.decoder(
+                x[:, :, i:i + 1, :, :],
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx
+            )
+            outs.append(out_i)
+        # one concat at the end -> much lower peak VRAM and fragmentation
+        out = torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
+        # help GC
+        try:
+            del outs
+        except Exception:
+            pass
+
         self.clear_cache()
         return out
 

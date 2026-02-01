@@ -29,7 +29,7 @@ def _chunked_call(module, x: torch.Tensor):
         module._ffn_chunks = chunks
         print(f"[FFN-Chunk] auto select chunks={chunks} for N={N}")
 
-    print(f"Existing chunk: N={N}")
+    #print(f"Existing chunk: N={N}")
 
     chunks = module._ffn_chunks
     if chunks <= 1:
