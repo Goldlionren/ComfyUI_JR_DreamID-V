@@ -42,6 +42,43 @@ from PIL import Image, ImageOps
 
 _THIS_DIR = os.path.dirname(__file__)
 
+def ffn_chunked_forward(ffn_module, x, chunks: int, dim_threshold: int):
+    # x expected: [B, N, C]
+    if chunks <= 1 or x.dim() != 3:
+        return ffn_module._orig_forward(x)
+
+    B, N, C = x.shape
+    if dim_threshold > 0 and N <= dim_threshold:
+        return ffn_module._orig_forward(x)
+
+    chunk_size = N // chunks
+    y = torch.empty_like(x)
+    for i in range(chunks):
+        s = i * chunk_size
+        e = (i + 1) * chunk_size if i < chunks - 1 else N
+        y[:, s:e, :] = ffn_module._orig_forward(x[:, s:e, :])
+    return y
+
+def patch_ffn_chunking(model, chunks: int = 2, dim_threshold: int = 4096):
+    for i, block in enumerate(model.blocks):
+        if hasattr(block, "ffn"):
+            ffn = block.ffn
+        elif hasattr(block, "ff"):
+            ffn = block.ff
+        elif hasattr(block, "mlp"):
+            ffn = block.mlp
+        else:
+            continue
+
+        # 只 patch 一次
+        if not hasattr(ffn, "_orig_forward"):
+            ffn._orig_forward = ffn.forward
+
+        def wrapped_forward(self_ffn, x):
+            return ffn_chunked_forward(self_ffn, x, chunks=chunks, dim_threshold=dim_threshold)
+
+        ffn.forward = types.MethodType(wrapped_forward, ffn)
+
 class DreamIDV:
 
     def __init__(
@@ -143,14 +180,26 @@ class DreamIDV:
                              eps=config.eps)
     
         logging.info(f"loading ckpt.")
-        state = torch.load(dreamidv_ckpt, map_location=self.device)
+        state = torch.load(dreamidv_ckpt, map_location="cpu")  # 1) 权重先落 CPU
+
+        # 确保模型参数在哪里：你要推理用GPU就放GPU
+        self.model.to(self.device)                               # <-- 放在 load_state_dict 前
+
         logging.info(f"loading state dict.")
         missing_keys, unexpected_keys = self.model.load_state_dict(state, strict=False)
-        logging.info(f"len missing_keys: {len(missing_keys)}")
-        logging.info(f"len unexpected_keys: {len(unexpected_keys)}")
-        print(missing_keys)
-        print(unexpected_keys)
+
         self.model.eval().requires_grad_(False)
+
+        # debug info
+        b0 = self.model.blocks[0]
+        print("block0 type:", type(b0))
+        print("has ffn:", hasattr(b0, "ffn"), "has ff:", hasattr(b0, "ff"), "has mlp:", hasattr(b0, "mlp"))
+        print("ffn obj:", getattr(b0, "ffn", None))
+
+        # Patch FFN chunking to reduce memory usage
+        from .modules.ffn_chunk import patch_model_ffn_chunking
+        patch_model_ffn_chunking(self.model, verbose=True)
+
 
         if use_usp:
             from xfuser.core.distributed import \
@@ -233,7 +282,8 @@ class DreamIDV:
                 )
                 
                 video_frames = video_transform(frames)
-                video_vae_latent = self.vae.encode([video_frames], device)[0]
+                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
+                    video_vae_latent = self.vae.encode([video_frames.to(device=device, dtype=self.param_dtype)], device)[0]
             
                 ref_vae_latents["video"].append(video_vae_latent)
 
@@ -267,7 +317,8 @@ class DreamIDV:
                 )
                 
                 video_frames = video_mask_transform(frames) 
-                video_vae_latent = self.vae.encode([video_frames], device)[0]
+                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
+                    video_vae_latent = self.vae.encode([video_frames.to(device=device, dtype=self.param_dtype)], device)[0]
                 video_vae_latent = video_vae_latent 
                 ref_vae_latents["mask"].append(video_vae_latent)
 
@@ -306,7 +357,8 @@ class DreamIDV:
                     ]
                 )
                 new_img = image_transform([new_img])
-                img_vae_latent = self.vae.encode([new_img], device)[0]
+                with torch.no_grad(), amp.autocast(dtype=self.param_dtype):
+                    img_vae_latent = self.vae.encode([new_img.to(device=device, dtype=self.param_dtype)], device)[0]
                 ref_vae_latents["image"].append(img_vae_latent)
             else:
                 print("Unknown file type.")
@@ -431,7 +483,7 @@ class DreamIDV:
                 target_shape[1],
                 target_shape[2],
                 target_shape[3],
-                dtype=torch.float32,
+                dtype=self.param_dtype,
                 device=self.device,
                 generator=seed_g)
         ]
@@ -482,7 +534,7 @@ class DreamIDV:
                     latents[0].unsqueeze(0),
                     return_dict=False,
                     generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
+                latents = [temp_x0.squeeze(0).to(self.param_dtype)]
 
             # finalize progress (optional): ensure bar reaches the end
             if update_fn is not None:
@@ -492,6 +544,10 @@ class DreamIDV:
                     update_fn()
 
             x0 = latents
+
+            print("[DEBUG] autocast target dtype =", self.param_dtype)
+            print("[DEBUG] input latent dtype =", x0[0].dtype)
+
 
             if offload_model:
                 self.model.cpu()
