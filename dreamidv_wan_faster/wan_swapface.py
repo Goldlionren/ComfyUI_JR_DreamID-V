@@ -510,7 +510,28 @@ class DreamIDV:
                 ref_vae_latents["image"].append(img_vae_latent)
             else:
                 print("Unknown file type.")
-       
+
+        # ---- Safety: align video/mask latent time length ---------------------------------
+        # Chunked VAE encode may produce different latent T' lengths between video and mask
+        # (especially when one path OOM-retries with smaller t_chunk and the other doesn't).
+        # This would crash later at torch.concat([y_i_v, msk]).
+        if len(ref_vae_latents["video"]) > 0 and len(ref_vae_latents["mask"]) > 0:
+            try:
+                v0 = ref_vae_latents["video"][0]
+                m0 = ref_vae_latents["mask"][0]
+                tv = int(v0.shape[1])
+                tm = int(m0.shape[1])
+                if tv != tm:
+                    tmin = min(tv, tm)
+                    logging.warning(
+                        f"[VAE-Encode-align] video/mask latent T' mismatch (video={tv}, mask={tm}) -> clamp to {tmin}"
+                    )
+                    ref_vae_latents["video"][0] = v0[:, :tmin, ...].contiguous()
+                    ref_vae_latents["mask"][0]  = m0[:, :tmin, ...].contiguous()
+            except Exception:
+               pass
+ 
+
         ref_vae_latents["image"] = torch.cat(ref_vae_latents["image"], dim=0)
         ref_vae_latents["video"] = torch.cat(ref_vae_latents["video"], dim=0)
         ref_vae_latents["mask"] = torch.cat(ref_vae_latents["mask"], dim=0)
