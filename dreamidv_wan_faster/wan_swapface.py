@@ -38,8 +38,9 @@ from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.na_resize import NaResize, DivisibleCrop, Rearrange
 from torchvision.transforms import ToTensor,Normalize,Compose
-import math
 from PIL import Image, ImageOps
+import warnings
+
 
 _THIS_DIR = os.path.dirname(__file__)
 
@@ -280,6 +281,43 @@ class DreamIDV:
  
                 # concat along time dim=1 for [Cz, T', h', w']
                 out = torch.cat(lat_parts, dim=1) if len(lat_parts) > 1 else lat_parts[0]
+
+                # ------------------------------------------------------------
+                # IMPORTANT: time-strided video VAE (stride_t usually=4) is NOT
+                # linear in T when encoding chunks independently.
+                # Example (stride_t=4):
+                #   encode(13 frames) => latent T' = 4
+                #   encode(6)+encode(6)+encode(1) => 2+2+1 = 5  (too long)
+                #
+                # If video OOM triggers chunking but mask does not, this causes
+                # video latent T' != mask latent T', and later concat fails.
+                #
+                # Fix: clamp concatenated latent time length to the expected
+                # length of encoding the (trimmed) full sequence.
+                # ------------------------------------------------------------
+                try:
+                    stride_t = int(getattr(self, "vae_stride", (4, 8, 8))[0])
+                    # input frames are trimmed in load_image_latent_ref_ip_video to:
+                    # frames_num = floor((T-1)/4)*4 + 1  (to satisfy model constraint)
+                    T_trim = ((T - 1) // 4) * 4 + 1
+                    # expected latent length after temporal stride
+                    expected_T_lat = ((T_trim - 1) // stride_t) + 1
+                    got_T_lat = int(out.shape[1])
+                    if got_T_lat != expected_T_lat:
+                        if got_T_lat < expected_T_lat:
+                            logging.warning(
+                                f"[VAE-Encode-{tag}] latent T' shorter than expected "
+                                f"(got {got_T_lat}, expected {expected_T_lat})"
+                            )
+                        else:
+                            logging.warning(
+                                f"[VAE-Encode-{tag}] latent T' longer than expected "
+                                f"(got {got_T_lat}, expected {expected_T_lat}) -> truncating"
+                            )
+                            out = out[:, :expected_T_lat, ...].contiguous()
+                except Exception:
+                    pass
+
                 return out
  
             except torch.OutOfMemoryError as oom:
