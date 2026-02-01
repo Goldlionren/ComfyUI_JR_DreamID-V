@@ -962,20 +962,22 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
                 offload_model=True,
             )
         finally:
-            # Explicitly drop any tensor refs and clear cache
+            # Explicitly drop tensor refs.
+            # IMPORTANT:
+            #   Do NOT call torch.cuda.empty_cache()/mm.soft_empty_cache() here.
+            #   Warmup is intended to keep allocator segments / compiled kernels "hot".
+            #   Emptying cache here can neutralize warmup benefits.
             try:
-                del _
-            except Exception:
-                pass
-            # Warmup goal is to KEEP allocator/kernel caches "warm".
-            # Do NOT call empty_cache / mm.soft_empty_cache here.
-            try:
-                gc.collect()
++                del _
             except Exception:
                 pass
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                gc.collect()
             except Exception:
                 pass
 
