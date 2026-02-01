@@ -968,7 +968,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
             #   Warmup is intended to keep allocator segments / compiled kernels "hot".
             #   Emptying cache here can neutralize warmup benefits.
             try:
-+                del _
+                del _
             except Exception:
                 pass
             try:
