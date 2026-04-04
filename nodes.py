@@ -135,7 +135,39 @@ except ImportError:
     VideoFromFile = None
 
 
+def _resolve_video_path(video_obj) -> str:
+    """
+    Resolve a VIDEO object to a file path.
+    If the video source is BytesIO (in-memory), save it to a temp file and return that path.
+    This allows the node to accept both file-path videos and BytesIO videos.
+    """
+    if video_obj is None:
+        raise ValueError("Video object is None")
 
+    src = video_obj.get_stream_source()
+
+    # If it's already a string path and the file exists, return it
+    if isinstance(src, (str, os.PathLike)) and os.path.exists(src):
+        return str(src)
+
+    # If it's BytesIO or other in-memory object, save to temp file
+    if hasattr(src, 'read'):
+        # It's likely a file-like object (BytesIO, etc.)
+        temp_dir = folder_paths.get_temp_directory()
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f'dreamidv_bytesio_{uuid.uuid4().hex}.mp4')
+        with open(temp_path, 'wb') as f:
+            f.write(src.read())
+        # Reset the BytesIO position for potential reuse
+        if hasattr(src, 'seek'):
+            src.seek(0)
+        return temp_path
+
+    # Fallback: if src is a path-like but doesn't exist yet (new file), return as string
+    if isinstance(src, (str, os.PathLike)):
+        return str(src)
+
+    raise TypeError(f"Cannot resolve video source to a path: {type(src)}")
 
 
 def _which_bin(name: str) -> str:
@@ -697,7 +729,7 @@ class RunningHub_DreamID_V_Sampler:
         print(pipeline.config)
         sample_steps = kwargs.get('sample_steps')
         #self.pbar = comfy.utils.ProgressBar(sample_steps + 1)
-        ref_video_path = kwargs.get('video').get_stream_source()
+        ref_video_path = _resolve_video_path(kwargs.get('video'))
         ref_image = self.tensor_2_pil(kwargs.get('ref_image'))
         ref_image_path = os.path.join(folder_paths.get_temp_directory(), f'dreamidv_{uuid.uuid4()}.png')
         ref_image.save(ref_image_path)
@@ -1003,7 +1035,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
         # progress bar: we cannot know total steps precisely (chunks * (steps+1)) until probing video
         # We'll create per-chunk progress bars instead.
 
-        orig_video_path = kwargs.get('video').get_stream_source()
+        orig_video_path = _resolve_video_path(kwargs.get('video'))
         ref_video_path = orig_video_path
 
 
@@ -1363,11 +1395,9 @@ class JR_LoadVideoPlus:
         if video is None:
             raise ValueError("Input VIDEO is None")
 
-        # 关键：从 VIDEO 对象取真实文件路径
-        src = video.get_stream_source()
-        if not src or not os.path.exists(src):
-            raise FileNotFoundError(f"Video source not found: {src}")
-        
+        # 关键：从 VIDEO 对象取真实文件路径（支持 BytesIO 自动转临时文件）
+        src = _resolve_video_path(video)
+
         if VideoFromFile is None:
             raise RuntimeError("VideoFromFile is unavailable (comfy_api missing). Please update ComfyUI.")
 
