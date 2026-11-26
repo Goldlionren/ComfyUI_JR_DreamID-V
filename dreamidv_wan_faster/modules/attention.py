@@ -49,6 +49,33 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        # flash-attn is not installed (e.g. no wheel for the current
+        # Python/CUDA/torch combination, or a GPU architecture FA2 does not
+        # support): fall back to PyTorch SDPA, like attention() below.
+        if q_lens is not None:
+            warnings.warn(
+                'q_lens is ignored when using scaled_dot_product_attention; padded query rows are not zeroed.'
+            )
+        b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+        q = q.transpose(1, 2).to(dtype)
+        k = k.transpose(1, 2).to(dtype)
+        v = v.transpose(1, 2).to(dtype)
+        if q_scale is not None:
+            q = q * q_scale
+        attn_mask = None
+        if k_lens is not None:
+            # key padding mask, equivalent to the varlen k_lens of flash-attn
+            attn_mask = (torch.arange(lk, device=k.device)[None, :]
+                         < k_lens.to(k.device)[:, None]).view(b, 1, 1, lk)
+            if causal:
+                attn_mask = attn_mask & torch.ones(
+                    lq, lk, dtype=torch.bool, device=q.device).tril()
+                causal = False
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+            is_causal=causal, scale=softmax_scale)
+        return out.transpose(1, 2).contiguous().type(out_dtype)
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
