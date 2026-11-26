@@ -568,6 +568,7 @@ class RunningHub_DreamID_V_Sampler:
             "optional": {
                 "custom_width": ("INT", {"default": 832, "min": 64, "max": 2048, "step": 8}),
                 "custom_height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 8}),
+                "guide_scale_img": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             }
         }
 
@@ -689,7 +690,7 @@ class RunningHub_DreamID_V_Sampler:
         #kiki hardcode
         sample_shift = 5.0
         sample_solver = 'unipc'
-        sample_guide_scale_img = 4.0
+        sample_guide_scale_img = float(kwargs.get('guide_scale_img', 4.0))
 
         pipeline = kwargs.get('pipeline')
         print(pipeline.config)
@@ -1078,7 +1079,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
             # Use same "hardcode" params as your sampler uses (keep consistent)
             sample_shift = 5.0
             sample_solver = "unipc"
-            sample_guide_scale_img = 4.0
+            sample_guide_scale_img = float(kwargs.get('guide_scale_img', 4.0))
 
             self._warmup_pass(
                 pipeline=pipeline,
@@ -1104,7 +1105,7 @@ class RunningHub_DreamID_V_LongVideo_Sampler(RunningHub_DreamID_V_Sampler):
         text_prompt = 'change face'
         sample_shift = 5.0
         sample_solver = 'unipc'
-        sample_guide_scale_img = 4.0
+        sample_guide_scale_img = float(kwargs.get('guide_scale_img', 4.0))
 
         global_out_index = 0
 
